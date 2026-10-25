@@ -16,25 +16,9 @@ A maior parte da cota não vai para o raciocínio do líder. Vai para o que ele 
 
 ## Como funciona
 
-```text
-você ──► líder (Claude Code, Codex, Antigravity, Kimi...)
-           │  tarefa braçal? delega sozinho
-           ▼
-   ┌─ comando:  bin/rails test 2>&1 | pirlo digest
-   │            (o líder roda o comando, com as permissões dele)
-   └─ leitura:  pirlo ask "o que a referência X diz sobre Y?"
-           │
-           ▼
-         pirlo: saída curta? devolve direto, sem worker
-           │
-           ▼
-         worker: CLI oficial em modo só leitura
-         (agy com Gemini Flash, codex com modelo barato, claude com Haiku...)
-           │
-           ▼
-         resumo curto com arquivo:linha ──► líder
-         + uma linha no log local (usage.jsonl)
-```
+<p align="center">
+  <img src="assets/como-funciona.svg" alt="Você conversa com o líder (Claude Code, Codex, Antigravity...). O líder roda o comando e manda a saída ao pirlo com pirlo digest, ou pede uma leitura com pirlo ask. Saída curta volta direto. O resto vai para a fila de workers, uma marca por vez (agy, codex, native), que passa para o próximo quando um fica sem cota. O worker devolve um resumo curto com arquivo:linha ao líder. Cada delegação vira uma linha no log, e quando a cota do líder acaba o pirlo deixa um passe pronto para outra IA." width="880">
+</p>
 
 | Comando | Para quê |
 | --- | --- |
