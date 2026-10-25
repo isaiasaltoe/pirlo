@@ -1357,7 +1357,8 @@ def read_claude_transcript(path, root):
                     file_path = (part.get("input") or {}).get("file_path") or (part.get("input") or {}).get("notebook_path")
                     if file_path:
                         try:
-                            file_path = os.path.relpath(file_path, root)
+                            # Both sides resolved, so a symlinked spelling still lands inside root.
+                            file_path = os.path.relpath(os.path.realpath(file_path), os.path.realpath(root))
                         except ValueError:
                             continue
                         if not file_path.startswith("..") and file_path not in edited:
