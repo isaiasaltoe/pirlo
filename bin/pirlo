@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 BUILTIN_CLIS = ("agy", "codex", "claude")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULTS = {
@@ -52,7 +52,7 @@ ERROR_LINE = re.compile(
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Read-only commands only: pirlo never runs the lead's commands, and edit keeps asking.
 ALLOW_RULES = ["Bash(pirlo ask *)", "Bash(pirlo digest*)", "Bash(pirlo savings*)",
-               "Bash(pirlo detect*)", "Bash(pirlo show*)"]
+               "Bash(pirlo detect*)", "Bash(pirlo show*)", "Bash(pirlo passe*)"]
 LEADER_INSTRUCTIONS = """# pirlo
 
 Hand bulky, low-judgment work to a cheaper worker with the `pirlo` command instead of doing it \
@@ -67,6 +67,10 @@ Use the short reply as is and open only the path:line spots you must check. Inde
 run as parallel commands. Keep planning, design, decisions and small edits yourself. If the reply \
 says PIRLO_FAILED or PIRLO_NATIVE, or pirlo is not set up, do the task yourself. If it says \
 PIRLO_RESTRICTED, a learning tool is active: never solve exercises or give fixes.
+
+If `.pirlo/passe.md` exists, another AI handed its unfinished work over when its quota ran out. At \
+the start, tell the user in one line and offer to continue; when you take it over, read the file \
+and run `pirlo passe --done`.
 """
 
 
@@ -635,7 +639,7 @@ def contract(mode, words, restricted):
         rules.append("The user is a student using a learning tool. Never solve exercises, never "
                      "write solution code and never give the fix for their errors. Report only "
                      "facts: what files contain, what commands printed, where things are.")
-    lines = ["You are a worker for another coding agent (the lead). The lead reads only your "
+    lines = [f"{WORKER_PROMPT} (the lead). The lead reads only your "
              "reply, never the raw material, so it must be short and exact.", "Rules:"]
     lines += [f"- {rule}" for rule in rules]
     return "\n".join(lines)
@@ -674,7 +678,9 @@ def build_command(config, spec, mode, cwd, prompt):
         argv.append("-")
         return argv, prompt, "jsonl"
     if cli == "claude":
-        argv = [exe, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
+        # --no-session-persistence keeps worker runs out of the lead's history, which the passe reads.
+        argv = [exe, "-p", "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+                "--permission-mode",
                 "acceptEdits" if mode == "edit" else "plan",
                 "--strict-mcp-config", "--disallowedTools", "Agent"]
         if model:
@@ -1273,10 +1279,172 @@ def cmd_savings(args):
     return 0
 
 
+# ---------------------------------------------------------------- passe (handover)
+# When a lead runs out of quota, pirlo writes .pirlo/passe.md from the conversation the lead
+# saved on disk and from git, without calling any model, so the next AI picks up the work.
+
+PASSE = "passe.md"
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def claude_projects():
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    return base / "projects"
+
+
+WORKER_PROMPT = "You are a worker for another coding agent"
+
+
+def newest_claude_transcript(root):
+    """The newest Claude Code session of this folder that is not a pirlo worker run."""
+    folder = claude_projects() / re.sub(r"[^A-Za-z0-9]", "-", str(root))
+    files = sorted(folder.glob("*.jsonl"), key=lambda path: path.stat().st_mtime,
+                   reverse=True) if folder.is_dir() else []
+    for path in files[:10]:
+        try:
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                head = handle.read(20000)
+        except OSError:
+            continue
+        if WORKER_PROMPT not in head:
+            return path
+    return None
+
+
+def plain_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if any(isinstance(part, dict) and part.get("type") == "tool_result" for part in content):
+            return ""
+        return "\n".join(part.get("text", "") for part in content
+                         if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+def read_claude_transcript(path, root):
+    """The user's requests, the last answer and the files edited, from a Claude Code session."""
+    asks, answer, edited = [], "", []
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return asks, answer, edited
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+        if entry.get("type") == "user":
+            text = plain_text(message.get("content")).strip()
+            if text and not text.startswith("<") and WORKER_PROMPT not in text:
+                asks.append(text)
+        elif entry.get("type") == "assistant":
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            text = plain_text(content).strip()
+            if text:
+                answer = text
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "tool_use" and part.get("name") in EDIT_TOOLS:
+                    file_path = (part.get("input") or {}).get("file_path") or (part.get("input") or {}).get("notebook_path")
+                    if file_path:
+                        try:
+                            file_path = os.path.relpath(file_path, root)
+                        except ValueError:
+                            continue
+                        if not file_path.startswith("..") and file_path not in edited:
+                            edited.append(file_path)
+    return asks, answer, edited
+
+
+def cut(text, limit):
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + " [...]"
+
+
+def write_passe(root, lead, reason, transcript=None):
+    asks, answer, edited = read_claude_transcript(transcript, root) if transcript else ([], "", [])
+    status = run_quiet(["git", "-C", str(root), "status", "--short"])[1].strip()
+    stat = run_quiet(["git", "-C", str(root), "diff", "--stat"])[1].strip()
+    lines = [f"# pirlo passe from {lead}", "",
+             f"{lead} stopped: {reason} ({utcnow().astimezone().strftime('%Y-%m-%d %H:%M')}).",
+             "Continue the user's last request. Check the changed files with git diff before editing, "
+             "and tell the user in one line what you are picking up.", ""]
+    if asks:
+        lines += ["## What the user asked (oldest first)", ""]
+        lines += [f"- {cut(text, 600)}" for text in asks[-4:]] + [""]
+    if answer:
+        lines += [f"## Last answer from {lead}", "", cut(answer, 1500), ""]
+    if edited:
+        lines += ["## Files it edited", ""] + [f"- {name}" for name in edited[-30:]] + [""]
+    if status:
+        lines += ["## git status", "", "```", "\n".join(status.splitlines()[:40]), "```", ""]
+    if stat:
+        lines += ["## git diff --stat", "", "```", "\n".join(stat.splitlines()[-25:]), "```", ""]
+    path = ensure_local_dir(root) / PASSE
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def cmd_passe(args):
+    root = repo_root(args.cwd or os.getcwd())
+    path = local_dir(root) / PASSE
+    if args.done:
+        if path.exists():
+            os.replace(path, local_dir(root) / f"passe-{utcnow().strftime('%Y%m%d-%H%M%S')}.md")
+            print("passe closed")
+        return 0
+    lead = args.lead or lead_brand() or "the previous AI"
+    transcript = args.transcript or (newest_claude_transcript(root) if lead == "claude" else None)
+    written = write_passe(root, lead, args.reason or "handed over by the user", transcript)
+    print(f"passe ready: {os.path.relpath(written, os.getcwd())}. Open another AI here and say: continue")
+    return 0
+
+
+def notify(message):
+    """Best effort: a line on the terminal and a desktop notification."""
+    if os.environ.get("PIRLO_NO_NOTIFY"):
+        return
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write(f"\a\n{message}\n")
+    except OSError:
+        pass
+    for argv in (["notify-send", "pirlo", message],
+                 ["osascript", "-e", f'display notification "{message}" with title "pirlo"']):
+        if shutil.which(argv[0]):
+            run_quiet(argv, timeout=5)
+            break
+
+
+def cmd_hook_stop_failure(payload):
+    """StopFailure with matcher rate_limit: Claude ran out of quota mid-session."""
+    root = repo_root(payload.get("cwd") or os.getcwd())
+    config, _, active = load_config(root)
+    if not active:
+        return 0
+    state = load_state()
+    rest(state, {"cli": "claude"}, config, (state.get("quota") or {}).get("claude"))
+    save_state(state)
+    path = write_passe(root, "claude", "it hit its usage limit", payload.get("transcript_path")
+                       or newest_claude_transcript(root))
+    notify(f"pirlo: Claude is out of quota. The handover is ready in {path}. "
+           "Open another AI in this folder and say: continue")
+    return 0
+
+
 def cmd_hook(args):
     """SessionStart hook: one short reminder per session, nothing where pirlo is off."""
     if os.environ.get("PIRLO_WORKER"):
         return 0
+    if args.stop_failure:
+        try:
+            raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+            return cmd_hook_stop_failure(json.loads(raw) if raw.strip() else {})
+        except Exception:  # a hook must never break the session
+            return 0
     try:
         root = repo_root(os.getcwd())
         config, source, active = load_config(root)
@@ -1294,6 +1462,10 @@ def cmd_hook(args):
             "Keep planning, design, decisions and small edits yourself.")
     if found:
         text += f" {', '.join(found)} is active, so workers stay read-only and never solve exercises."
+    if (local_dir(root) / PASSE).exists():
+        text += (" .pirlo/passe.md holds unfinished work another AI handed over when its quota ran "
+                 "out: tell the user in one line and offer to continue; when you take it over, read "
+                 "it and run `pirlo passe --done`.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                              "additionalContext": text}}))
     return 0
@@ -1341,7 +1513,7 @@ RAW_URL = "https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/"
 SKILL_NAMES = ("pirlo", "pirlo-setup", "pirlo-savings")
 CODEX_RULES = """# Codex rules: let pirlo's read-only commands run outside the sandbox, without asking,
 # so they can reach the worker CLIs over the network. pirlo edit keeps asking.
-prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show"]], decision = "allow")
+prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show", "passe"]], decision = "allow")
 """
 TEXT = {
     "pt": {
@@ -1803,7 +1975,15 @@ def main(argv=None):
     p.set_defaults(func=cmd_savings)
     p = sub.add_parser("hook", help="SessionStart hook for Claude Code")
     p.add_argument("--claude-code", action="store_true", help="the lead is Claude Code")
+    p.add_argument("--stop-failure", action="store_true", help="StopFailure hook: Claude hit its limit")
     p.set_defaults(func=cmd_hook)
+    p = sub.add_parser("passe", help="hand unfinished work over to another AI")
+    p.add_argument("--lead", help="the AI that stopped: claude, codex, agy...")
+    p.add_argument("--reason", help="why it stopped")
+    p.add_argument("--transcript", help="the session file to summarize")
+    p.add_argument("--cwd")
+    p.add_argument("--done", action="store_true", help="close the passe after taking the work over")
+    p.set_defaults(func=cmd_passe)
     p = sub.add_parser("allow", help="let Claude Code run pirlo's read-only commands unprompted")
     p.set_defaults(func=cmd_allow)
     p = sub.add_parser("instructions", help="print the lead instructions for AGENTS.md")

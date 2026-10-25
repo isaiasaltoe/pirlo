@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -41,6 +42,7 @@ class PirloCase(unittest.TestCase):
             "HOME": str(self.home),
             "PIRLO_HOME": str(self.home / ".config" / "pirlo"),
             "STUB_RECORD": str(self.record),
+            "PIRLO_NO_NOTIFY": "1",
         }
 
     def tearDown(self):
@@ -159,6 +161,7 @@ class Ask(PirloCase):
         argv = self.calls()[0]["argv"]
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
         self.assertIn("Agent", argv)
+        self.assertIn("--no-session-persistence", argv)
         self.assertEqual(self.log()[0]["usage"]["inputTokens"], 31003)
 
     def test_custom_adapter_with_prompt_argument(self):
@@ -607,6 +610,81 @@ class Setup(PirloCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
 
+class Passe(PirloCase):
+    def transcript(self, folder=None):
+        folder = folder or self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.repo))
+        folder.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": "fix the login test"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Looking at the test."},
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": str(self.repo / "app.rb")}},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": "/tmp/elsewhere.txt"}}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}},
+            {"type": "user", "isMeta": True, "message": {"content": "meta"}},
+            {"type": "user", "message": {"content": "<system-reminder>noise</system-reminder>"}},
+            {"type": "user", "message": {"content": [{"type": "text", "text": "now the redirect too"}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "The redirect goes to /home."}]}},
+        ]
+        path = folder / "session.jsonl"
+        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return path
+
+    def test_passe_from_a_claude_session_and_git(self):
+        self.transcript()
+        (self.repo / "app.rb").write_text("puts 'changed'\n")
+        out = self.pirlo("passe", "--lead", "claude")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        text = (self.repo / ".pirlo" / "passe.md").read_text()
+        self.assertIn("- fix the login test", text)
+        self.assertIn("- now the redirect too", text)
+        self.assertNotIn("noise", text)
+        self.assertNotIn("meta", text)
+        self.assertIn("The redirect goes to /home.", text)
+        self.assertIn("- app.rb", text)
+        self.assertNotIn("elsewhere", text)
+        self.assertIn("M app.rb", text)
+        self.assertIn("continue", out.stdout)
+
+    def test_worker_sessions_are_skipped(self):
+        path = self.transcript()
+        worker = path.parent / "worker.jsonl"
+        worker.write_text(json.dumps({"type": "user", "message": {"content": "You are a worker for another coding agent (the lead)."}}) + "\n")
+        os.utime(worker, (time.time() + 60, time.time() + 60))
+        self.pirlo("passe", "--lead", "claude")
+        self.assertIn("fix the login test", (self.repo / ".pirlo" / "passe.md").read_text())
+
+    def test_rate_limit_hook_writes_the_passe_and_rests_claude(self):
+        path = self.transcript(Path(self.tmp.name) / "anywhere")
+        self.save(AUTHOR_WORKER)
+        payload = {"hook_event_name": "StopFailure", "transcript_path": str(path), "cwd": str(self.repo)}
+        out = self.pirlo("hook", "--stop-failure", stdin=json.dumps(payload), cwd=Path(self.tmp.name))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        text = (self.repo / ".pirlo" / "passe.md").read_text()
+        self.assertIn("claude stopped: it hit its usage limit", text)
+        self.assertIn("fix the login test", text)
+        state = json.loads((self.home / ".config" / "pirlo" / "state.json").read_text())
+        self.assertIn("claude", state["cooldown"])
+
+    def test_rate_limit_hook_never_breaks_on_bad_input(self):
+        out = self.pirlo("hook", "--stop-failure", stdin="not json")
+        self.assertEqual(out.returncode, 0)
+
+    def test_next_session_is_told_and_done_closes_it(self):
+        self.save(AUTHOR_WORKER)
+        self.pirlo("passe", "--lead", "agy")
+        context = json.loads(self.pirlo("hook").stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(".pirlo/passe.md", context)
+        self.pirlo("passe", "--done")
+        self.assertFalse((self.repo / ".pirlo" / "passe.md").exists())
+        self.assertEqual(len(list((self.repo / ".pirlo").glob("passe-*.md"))), 1)
+        context = json.loads(self.pirlo("hook").stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("passe", context)
+
+    def test_instructions_tell_other_leads_about_the_passe(self):
+        self.assertIn(".pirlo/passe.md", self.pirlo("instructions").stdout)
+
+
 class Hook(PirloCase):
     def context(self, **env):
         out = self.pirlo("hook", **env)
@@ -676,6 +754,9 @@ class PluginFiles(unittest.TestCase):
         command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         self.assertIn('"${CLAUDE_PLUGIN_ROOT}/bin/pirlo" hook --claude-code', command)
         self.assertNotIn("UserPromptSubmit", hooks["hooks"])
+        stop = hooks["hooks"]["StopFailure"][0]
+        self.assertEqual(stop["matcher"], "rate_limit")
+        self.assertIn("hook --stop-failure", stop["hooks"][0]["command"])
 
     def test_portable_skills_point_at_the_script(self):
         skill = ROOT / "portable" / "skills" / "pirlo"

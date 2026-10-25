@@ -10,6 +10,18 @@
           }
         ]
       }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "rate_limit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/pirlo\" hook --stop-failure 2>/dev/null || python \"${CLAUDE_PLUGIN_ROOT}/bin/pirlo\" hook --stop-failure 2>/dev/null || true",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }

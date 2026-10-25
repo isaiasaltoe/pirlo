@@ -108,7 +108,21 @@ O pirlo cuida disso sozinho, a cada delegação. Ele percorre a fila de workers 
 
 O rodapé da resposta conta o que aconteceu, por exemplo `[pirlo: codex gpt-6-luna medium, 9.2s; agy gemini-3.8-flash-medium out of quota (resting until 15:30)]`. Se todas as marcas estiverem sem cota, o líder faz o trabalho sozinho; no Claude Code, o subagente em Haiku assume. Para ver a fila e as cotas a qualquer momento, rode `pirlo show`.
 
-O **líder**, o pirlo não troca: é o programa em que você está digitando, e cada IA guarda a sua própria conversa.
+## Quando a cota do líder acaba: o passe
+
+O **líder** o pirlo não troca, porque é o programa em que você está digitando, e cada IA guarda a sua própria conversa. O que ele faz é deixar a passagem pronta, para você não ter que reexplicar nada.
+
+No Claude Code, isso é automático. Quando a cota acaba, o Claude Code dispara o evento `StopFailure` com o motivo `rate_limit`, e o hook do pirlo:
+
+1. monta o `.pirlo/passe.md` sem chamar nenhuma IA, só lendo arquivos: o que você pediu por último, a última resposta, os arquivos que ele editou, o `git status` e o `git diff --stat`. Ele lê isso do histórico da conversa que o Claude Code grava em `~/.claude/projects/`;
+2. tira o Claude da fila de workers até a cota voltar;
+3. avisa no terminal (e com uma notificação, se o sistema tiver `notify-send` ou `osascript`): *"Claude is out of quota. The handover is ready... Open another AI in this folder and say: continue"*.
+
+Você abre outra IA na mesma pasta, como o Antigravity, e diz "continua". As instruções do pirlo nessa IA (no `AGENTS.md` ou na skill) mandam que ela veja o `.pirlo/passe.md`, avise em uma linha o que vai retomar, leia o passe e rode `pirlo passe --done`, que arquiva o arquivo. Quando você volta ao Claude Code depois e existe um passe aberto de outra IA, o lembrete do início da sessão também avisa.
+
+Não dá para agir *antes* de a cota acabar, porque o Claude Code não informa ao pirlo quanto da cota do líder já foi usada. Mas isso não faz falta: o passe é montado a partir do que ficou gravado em disco, sem precisar da IA que parou, então nada se perde.
+
+Nos outros líderes, rode `pirlo passe` no terminal quando a cota acabar. Sem o histórico do Claude, o passe traz só o `git status` e o `git diff --stat`.
 
 ## Uso
 
@@ -164,7 +178,8 @@ O Claude Code pede aprovação antes de rodar comandos. Se você aceitar no setu
       "Bash(pirlo digest*)",
       "Bash(pirlo savings*)",
       "Bash(pirlo detect*)",
-      "Bash(pirlo show*)"
+      "Bash(pirlo show*)",
+      "Bash(pirlo passe*)"
     ]
   }
 }
@@ -179,7 +194,7 @@ No Codex, todo comando roda num sandbox que, por padrão, **bloqueia a internet*
 O Codex resolve isso com **regras** (arquivos `.rules`): um comando que casa com uma regra `allow` roda fora do sandbox sem perguntar. Se você aceitar no setup, ele grava `~/.codex/rules/pirlo.rules`, que libera só os comandos de leitura do pirlo:
 
 ```python
-prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show"]], decision = "allow")
+prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show", "passe"]], decision = "allow")
 ```
 
 Os comandos do seu projeto continuam no sandbox. Para conferir a regra:
@@ -291,6 +306,7 @@ A primeira versão foi feita numa máquina sem o `agy` e sem as contas do autor.
 - o `agy` foi testado só com um CLI falso que imita a saída descrita no `agy --help`. O formato exato do `--output-format json` e da lista do `agy models` precisa ser confirmado na máquina real. Se não bater, o pirlo ainda devolve o texto, mas pode não ler o uso de tokens;
 - o `codex exec` e a regra do Codex foram conferidos no `codex` 0.164, mas nunca rodaram com uma conta logada. A leitura da cota do Codex segue o formato que ele grava nos arquivos de sessão, testada só com um arquivo de exemplo. Os workers Codex agora deixam a sessão gravada (sem `--ephemeral`), justamente para essa leitura ficar atualizada, então eles aparecem no histórico do `codex resume`;
 - a troca de worker por cota foi testada com CLIs falsos. A leitura da cota do Claude foi conferida com o `claude` real;
+- o passe foi montado a partir de uma conversa real do Claude Code, mas o hook `StopFailure` nunca disparou de verdade, porque não dá para esgotar uma cota aqui. O aviso no terminal pode não aparecer por cima da tela do Claude Code; a notificação do sistema e o arquivo `.pirlo/passe.md` não dependem disso;
 - o `claude -p` como worker, a delegação automática no Claude Code e o pipe usando as permissões da sessão foram testados de verdade;
 - o setup foi testado de verdade num terminal, instalando o plugin no `claude` e no `codex` reais, mas com o marketplace apontando para uma cópia local. A instalação a partir do GitHub (`curl ... | sh` e `--marketplace isaiasaltoe/pirlo`) só funciona com o repositório público.
 
