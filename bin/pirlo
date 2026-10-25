@@ -218,11 +218,11 @@ def restrictions(root, names):
 # ---------------------------------------------------------------- detection
 
 
-def run_quiet(argv, timeout=20):
+def run_quiet(argv, timeout=20, cwd=None):
     try:
         out = subprocess.run(
             argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+            encoding="utf-8", errors="replace", timeout=timeout, cwd=cwd,
         )
         return out.returncode, (out.stdout or "") + (out.stderr or "")
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -862,6 +862,22 @@ def cmd_propose(args):
     return 0
 
 
+def save_config(data, scope, root):
+    validate_config(data)
+    data["scope"] = scope
+    data.setdefault("version", 2)
+    if scope == "user":
+        path = user_config_path()
+        write_json(path, data)
+    else:
+        path = ensure_local_dir(root) / "config.json"
+        write_json(path, data)
+        if read_json(user_config_path()) is None:
+            # Keep pirlo off in repositories without their own config.
+            write_json(user_config_path(), {"version": 2, "scope": "local"})
+    return path
+
+
 def cmd_save(args):
     raw = sys.stdin.read()
     try:
@@ -869,20 +885,7 @@ def cmd_save(args):
     except ValueError as error:
         raise PirloError(f"config on stdin is not valid JSON: {error}")
     data = data.get("config", data) if isinstance(data, dict) else data
-    validate_config(data)
-    data["scope"] = args.scope
-    data.setdefault("version", 2)
-    if args.scope == "user":
-        path = user_config_path()
-        write_json(path, data)
-    else:
-        root = repo_root(os.getcwd())
-        path = ensure_local_dir(root) / "config.json"
-        write_json(path, data)
-        user = read_json(user_config_path())
-        if user is None:
-            # Keep pirlo off in repositories without their own config.
-            write_json(user_config_path(), {"version": 1, "scope": "local"})
+    path = save_config(data, args.scope, repo_root(os.getcwd()))
     print(f"saved {path}")
     return 0
 
@@ -1034,6 +1037,11 @@ def cmd_hook(args):
 
 
 def cmd_allow(args):
+    print(allow_rules())
+    return 0
+
+
+def allow_rules():
     """Let Claude Code run pirlo's read-only commands without a permission prompt."""
     base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     path = base / "settings.json"
@@ -1046,13 +1054,11 @@ def cmd_allow(args):
     if not isinstance(allow, list):
         raise PirloError(f"permissions.allow in {path} is not a list; add by hand: {rules}")
     added = [rule for rule in ALLOW_RULES if rule not in allow]
-    if added:
-        allow.extend(added)
-        write_json(path, data)
-        print(f"added to {path}: {', '.join(added)}")
-    else:
-        print(f"{path} already allows pirlo's read-only commands")
-    return 0
+    if not added:
+        return f"{path} already allows pirlo's read-only commands"
+    allow.extend(added)
+    write_json(path, data)
+    return f"added to {path}: {', '.join(added)}"
 
 
 def cmd_instructions(args):
@@ -1062,6 +1068,399 @@ def cmd_instructions(args):
 
 def cmd_log(args):
     print(log_path())
+    return 0
+
+
+# ---------------------------------------------------------------- terminal setup
+# The setup talks to a person in the terminal, in Portuguese or English. It costs no tokens.
+
+RAW_URL = "https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/"
+SKILL_NAMES = ("pirlo", "pirlo-setup", "pirlo-savings")
+CODEX_RULES = """# Codex rules: let pirlo's read-only commands run outside the sandbox, without asking,
+# so they can reach the worker CLIs over the network. pirlo edit keeps asking.
+prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show"]], decision = "allow")
+"""
+TEXT = {
+    "pt": {
+        "title": "pirlo setup",
+        "detecting": "Procurando as IAs instaladas (sem gastar cota)...",
+        "not_installed": "não instalado", "logged_in": "logado",
+        "logged_out": "instalado, mas NÃO logado (faça login antes)", "installed": "instalado",
+        "choose_one": "Escolha (número)", "choose_many": "Escolha (números separados por vírgula)",
+        "invalid": "  Opção inválida.", "yes_no": "(s/n)", "yes": "s", "no": "n",
+        "leaders_q": "Em quais IAs você quer usar o pirlo como líder?",
+        "leaders_why": "O líder é a IA que você usa no dia a dia. O pirlo ensina essa IA a passar o "
+                       "trabalho braçal (rodar testes, ler logs, docs e PDFs, buscas amplas) para "
+                       "outra mais barata, sem você pedir.",
+        "other": "Outra IA (Antigravity, Kimi, Copilot, opencode...)",
+        "missing": " (não instalado)",
+        "scope_q": "Onde o pirlo deve ficar ativo?",
+        "scope_why": "Global vale para todos os seus repositórios. Local vale só para este, e os "
+                     "outros continuam como estão. A configuração local fica em .pirlo/, fora do git.",
+        "scope_user": "Em todos os repositórios (global)", "scope_local": "Só neste repositório ({root})",
+        "no_repo": "Você não está num repositório git, então o pirlo fica ativo em todos (global). "
+                   "Para usar só num projeto, rode `pirlo setup` dentro dele.",
+        "note": "Obs.: {note}",
+        "worker_q": "Qual IA faz o trabalho braçal (o worker)?",
+        "worker_why": "O worker lê o material bruto e devolve só um resumo curto com arquivo:linha. "
+                      "Uma assinatura diferente da do líder poupa a cota dele. Ele roda em modo só "
+                      "leitura.",
+        "native": "native: o subagente do Claude Code (Haiku) faz o trabalho, sem outra assinatura",
+        "recommended": " (recomendado)",
+        "no_worker": "Nenhum worker disponível. Instale e faça login em outra IA (agy, codex...) e "
+                     "rode `pirlo setup` de novo.",
+        "allow_q": "Liberar no Claude Code os comandos de leitura do pirlo sem pedir aprovação?",
+        "allow_why": "O Claude Code pede aprovação antes de rodar comandos. Os comandos do pirlo só "
+                     "leem e pedem um resumo ao worker, então liberar é seguro. Os comandos do seu "
+                     "projeto, como os testes, continuam seguindo as suas regras de sempre, e o "
+                     "`pirlo edit`, que altera arquivos, continua pedindo aprovação. Grava em "
+                     "~/.claude/settings.json.",
+        "rules_q": "Gravar a regra do Codex para o pirlo rodar fora do sandbox?",
+        "rules_why": "No Codex, os comandos rodam num sandbox sem internet. O pirlo precisa de "
+                     "internet para falar com o worker, então sem a regra o Codex pediria aprovação "
+                     "a cada delegação. A regra (~/.codex/rules/pirlo.rules) libera só os comandos "
+                     "de leitura do pirlo; os comandos do seu projeto continuam no sandbox.",
+        "summary": "Resumo:", "s_leaders": "  Líderes: {v}", "s_scope": "  Escopo:  {v}",
+        "s_global": "global", "s_local": "só em {root}", "s_worker": "  Worker:  {v}",
+        "s_allow": "  Liberar comandos de leitura no Claude Code: {v}",
+        "s_rules": "  Regra do sandbox do Codex: {v}", "v_yes": "sim", "v_no": "não",
+        "apply_q": "Aplicar?", "nothing": "Nada foi alterado.",
+        "saved": "Configuração salva em {path}.",
+        "names": {"claude": "Claude Code", "codex": "Codex", "other": "outra IA"},
+        "failed": "    não deu certo: {tail}",
+        "skip": "  {name} não encontrado; pulando.",
+        "plugin_ok": "  Plugin instalado no {name}.",
+        "rules_ok": "  Regra do sandbox gravada em {path}.",
+        "skills_ok": "  Skills instaladas em {path}.",
+        "agents_has": "  O AGENTS.md já tem as instruções do pirlo.",
+        "agents_tracked": "  O AGENTS.md deste projeto está no git, então o bloco do pirlo vai "
+                          "aparecer no git diff. Adicionar mesmo assim?",
+        "agents_skip": "  Pulando. Ponha a saída de `pirlo instructions` no arquivo global da sua IA.",
+        "agents_ok": "  Instruções adicionadas ao AGENTS.md.",
+        "agents_excluded": "  Instruções adicionadas ao AGENTS.md, que fica fora dos seus commits.",
+        "skills_q": "  Se a sua IA lê skills (SKILL.md), digite a pasta de skills dela, por exemplo "
+                    "~/.agents/skills (Enter para pular)",
+        "global_file": "  Se ela lê um arquivo de instruções global (AGENTS.md, GEMINI.md...), adicione "
+                       "nele a saída de `pirlo instructions`.",
+        "done": "Pronto. Abra a sua IA e trabalhe normalmente: ela delega sozinha. Para ver a "
+                "economia estimada, rode `pirlo savings`.",
+    },
+    "en": {
+        "title": "pirlo setup",
+        "detecting": "Looking for installed AIs (spends no quota)...",
+        "not_installed": "not installed", "logged_in": "logged in",
+        "logged_out": "installed but NOT logged in (log in first)", "installed": "installed",
+        "choose_one": "Choose (number)", "choose_many": "Choose (numbers separated by commas)",
+        "invalid": "  Invalid option.", "yes_no": "(y/n)", "yes": "y", "no": "n",
+        "leaders_q": "Which AIs do you want to use pirlo with as the lead?",
+        "leaders_why": "The lead is the AI you use every day. pirlo teaches it to hand bulky work "
+                       "(running tests, reading logs, docs and PDFs, wide searches) to a cheaper "
+                       "one, without you asking.",
+        "other": "Another AI (Antigravity, Kimi, Copilot, opencode...)",
+        "missing": " (not installed)",
+        "scope_q": "Where should pirlo be on?",
+        "scope_why": "Global covers all your repositories. Local covers only this one, and the "
+                     "others stay as they are. The local config lives in .pirlo/, out of git.",
+        "scope_user": "In every repository (global)", "scope_local": "Only in this repository ({root})",
+        "no_repo": "You are not in a git repository, so pirlo will be on everywhere (global). To "
+                   "use it in one project only, run `pirlo setup` inside it.",
+        "note": "Note: {note}",
+        "worker_q": "Which AI does the bulky work (the worker)?",
+        "worker_why": "The worker reads the raw material and returns only a short summary with "
+                      "path:line. A different subscription from the lead's spares the lead's "
+                      "quota. It runs read-only.",
+        "native": "native: the Claude Code subagent (Haiku) does the work, no other subscription",
+        "recommended": " (recommended)",
+        "no_worker": "No worker available. Install and log in to another AI (agy, codex...) and "
+                     "run `pirlo setup` again.",
+        "allow_q": "Let Claude Code run pirlo's read-only commands without asking?",
+        "allow_why": "Claude Code asks before running commands. pirlo's commands only read and ask "
+                     "the worker for a summary, so allowing them is safe. Your project's commands, "
+                     "like tests, keep following your usual rules, and `pirlo edit`, which changes "
+                     "files, keeps asking. Writes to ~/.claude/settings.json.",
+        "rules_q": "Write the Codex rule so pirlo can run outside the sandbox?",
+        "rules_why": "In Codex, commands run in a sandbox with no internet. pirlo needs internet to "
+                     "reach the worker, so without the rule Codex would ask on every delegation. "
+                     "The rule (~/.codex/rules/pirlo.rules) allows only pirlo's read-only "
+                     "commands; your project's commands stay in the sandbox.",
+        "summary": "Summary:", "s_leaders": "  Leads:  {v}", "s_scope": "  Scope:  {v}",
+        "s_global": "global", "s_local": "only in {root}", "s_worker": "  Worker: {v}",
+        "s_allow": "  Allow read-only commands in Claude Code: {v}",
+        "s_rules": "  Codex sandbox rule: {v}", "v_yes": "yes", "v_no": "no",
+        "apply_q": "Apply?", "nothing": "Nothing was changed.",
+        "saved": "Config saved in {path}.",
+        "names": {"claude": "Claude Code", "codex": "Codex", "other": "another AI"},
+        "failed": "    did not work: {tail}",
+        "skip": "  {name} not found; skipping.",
+        "plugin_ok": "  Plugin installed in {name}.",
+        "rules_ok": "  Sandbox rule written to {path}.",
+        "skills_ok": "  Skills installed in {path}.",
+        "agents_has": "  AGENTS.md already has pirlo's instructions.",
+        "agents_tracked": "  This project's AGENTS.md is in git, so pirlo's block will show in "
+                          "git diff. Add it anyway?",
+        "agents_skip": "  Skipping. Put the output of `pirlo instructions` in your AI's global file.",
+        "agents_ok": "  Instructions added to AGENTS.md.",
+        "agents_excluded": "  Instructions added to AGENTS.md, which stays out of your commits.",
+        "skills_q": "  If your AI reads skills (SKILL.md), type its skills folder, for example "
+                    "~/.agents/skills (Enter to skip)",
+        "global_file": "  If it reads a global instructions file (AGENTS.md, GEMINI.md...), add the "
+                       "output of `pirlo instructions` to it.",
+        "done": "Done. Open your AI and work as usual: it delegates on its own. To see the "
+                "estimated savings, run `pirlo savings`.",
+    },
+}
+
+
+class Talk:
+    """Questions and messages in the chosen language."""
+
+    def __init__(self, lang="pt"):
+        self.lang = lang
+
+    def t(self, key, **values):
+        text = TEXT[self.lang][key]
+        return text.format(**values) if values else text
+
+    def say(self, key, **values):
+        print(self.t(key, **values))
+
+    def ask(self, prompt, default=""):
+        try:
+            answer = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+        except EOFError:
+            answer = ""
+        return answer or default
+
+    def confirm(self, prompt, default=True, why=None):
+        if why:
+            print(f"\n{why}")
+        yes, no = self.t("yes"), self.t("no")
+        answer = self.ask(f"{prompt} {self.t('yes_no')}", yes if default else no).lower()
+        return answer.startswith((yes, "s", "y"))
+
+    def choose(self, prompt, labels, default, multi=False, why=None):
+        """Numbered menu. Returns 0-based indices; the default holds 1-based numbers."""
+        print(f"\n{prompt}")
+        if why:
+            print(why)
+        for number, label in enumerate(labels, 1):
+            print(f"  {number}) {label}")
+        hint = self.t("choose_many" if multi else "choose_one")
+        for _ in range(5):
+            raw = self.ask(hint, ",".join(str(d) for d in default))
+            try:
+                picks = [int(part) - 1 for part in raw.replace(" ", "").split(",") if part]
+            except ValueError:
+                picks = []
+            if picks and all(0 <= p < len(labels) for p in picks) and (multi or len(picks) == 1):
+                return list(dict.fromkeys(picks))
+            self.say("invalid")
+        return [d - 1 for d in default]
+
+
+def pick_language():
+    env = (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower()
+    talk = Talk("pt")
+    choice = talk.choose("Idioma / Language", ["Português", "English"], [2 if env.startswith("en") else 1])
+    return Talk("en" if choice == [1] else "pt")
+
+
+def marketplace():
+    return os.environ.get("PIRLO_MARKETPLACE") or "isaiasaltoe/pirlo"
+
+
+def spec_label(spec, talk):
+    if spec["cli"] == "native":
+        return talk.t("native")
+    return " ".join(x for x in (spec["cli"], spec.get("model"), spec.get("effort")) if x)
+
+
+def worker_options(clis, leaders, proposal):
+    options = [proposal] if proposal else []
+    if "claude" in leaders:
+        options.append({"cli": "native"})
+    for c in clis:
+        if not c["installed"] or c["loggedIn"] is False or c.get("custom"):
+            continue
+        for model in c["models"]:
+            if c["cli"] in ("codex", "claude"):
+                options.append({"cli": c["cli"], "model": model, "effort": "medium"})
+            else:
+                options.append({"cli": c["cli"], "model": model})
+    unique = []
+    for spec in options:
+        if spec not in unique:
+            unique.append(spec)
+    return unique
+
+
+def step(argv, talk, cwd=None):
+    print("  $ " + " ".join(str(a) for a in argv))
+    code, out = run_quiet(argv, timeout=300, cwd=cwd)
+    if code != 0:
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        errors = [line for line in lines if re.match(r"(error|fatal)\b", line, re.IGNORECASE)]
+        useful = [line for line in lines if not re.match(r"\d+: |at |stack backtrace", line, re.IGNORECASE)]
+        talk.say("failed", tail=(errors or useful or ["?"])[0][:300])
+    return code == 0
+
+
+def install_claude(scope, root, talk):
+    exe = shutil.which("claude")
+    if not exe:
+        talk.say("skip", name="Claude Code")
+        return
+    if step([exe, "plugin", "install", "pirlo", "--marketplace", marketplace(), "--scope", scope],
+            talk, cwd=str(root) if scope == "local" else None):
+        talk.say("plugin_ok", name="Claude Code")
+
+
+def install_codex(talk, rules):
+    exe = shutil.which("codex")
+    if not exe:
+        talk.say("skip", name="Codex")
+        return
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    home.mkdir(parents=True, exist_ok=True)  # Codex refuses a CODEX_HOME that does not exist
+    step([exe, "plugin", "marketplace", "add", marketplace()], talk)
+    if step([exe, "plugin", "add", "pirlo@pirlo"], talk):
+        talk.say("plugin_ok", name="Codex")
+    if rules:
+        path = home / "rules" / "pirlo.rules"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(CODEX_RULES, encoding="utf-8")
+        talk.say("rules_ok", path=path)
+
+
+def install_skills(dest, talk):
+    dest = Path(dest).expanduser()
+    local = Path(__file__).resolve().parent.parent / "portable" / "skills"
+    for name in SKILL_NAMES:
+        target = dest / name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = local / name / "SKILL.md"
+        if source.is_file():
+            shutil.copyfile(source, target)
+        else:
+            import urllib.request
+            with urllib.request.urlopen(f"{RAW_URL}portable/skills/{name}/SKILL.md", timeout=30) as reply:
+                target.write_bytes(reply.read())
+    talk.say("skills_ok", path=dest)
+
+
+def install_other(scope, root, talk):
+    if scope == "user":
+        folder = talk.ask(talk.t("skills_q"))
+        if folder:
+            install_skills(folder, talk)
+        talk.say("global_file")
+        return
+    agents = Path(root) / "AGENTS.md"
+    text = agents.read_text(encoding="utf-8") if agents.exists() else ""
+    if re.search(r"^# pirlo\s*$", text, re.MULTILINE):
+        talk.say("agents_has")
+        return
+    tracked = run_quiet(["git", "-C", str(root), "ls-files", "--error-unmatch", "AGENTS.md"])[0] == 0
+    if tracked and not talk.confirm(talk.t("agents_tracked"), False):
+        talk.say("agents_skip")
+        return
+    with agents.open("a", encoding="utf-8") as handle:
+        handle.write(("\n" if text and not text.endswith("\n\n") else "") + LEADER_INSTRUCTIONS)
+    if tracked:
+        talk.say("agents_ok")
+        return
+    exclude = Path(root) / ".git" / "info" / "exclude"
+    if exclude.parent.is_dir():
+        current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if "/AGENTS.md" not in current.split():
+            with exclude.open("a", encoding="utf-8") as handle:
+                handle.write(("\n" if current and not current.endswith("\n") else "") + "/AGENTS.md\n")
+    talk.say("agents_excluded")
+
+
+def cmd_setup(args):
+    talk = pick_language()
+    root = repo_root(os.getcwd())
+    in_repo = (Path(root) / ".git").exists()
+    config, _, _ = load_config(root)
+    print(f"\n{talk.t('title')}\n")
+    talk.say("detecting")
+    clis = detect(config)
+    by_name = {c["cli"]: c for c in clis}
+    for c in clis:
+        state = talk.t("not_installed") if not c["installed"] else talk.t(
+            {True: "logged_in", False: "logged_out", None: "installed"}[c["loggedIn"]])
+        print(f"  {c['cli']:7} {state}")
+
+    leaders = [("claude", "Claude Code"), ("codex", "Codex"), ("other", talk.t("other"))]
+    labels = [label + ("" if name == "other" or by_name[name]["installed"] else talk.t("missing"))
+              for name, label in leaders]
+    default = [n for n, (name, _) in enumerate(leaders, 1)
+               if name != "other" and by_name[name]["installed"]] or [3]
+    chosen = [leaders[i][0] for i in talk.choose(talk.t("leaders_q"), labels, default, multi=True,
+                                                 why=talk.t("leaders_why"))]
+
+    if in_repo:
+        picked = talk.choose(talk.t("scope_q"), [talk.t("scope_user"), talk.t("scope_local", root=root)],
+                             [1], why=talk.t("scope_why"))
+        scope = "user" if picked == [0] else "local"
+    else:
+        print()
+        talk.say("no_repo")
+        scope = "user"
+
+    lead = next((name for name in chosen if name != "other"), "other")
+    proposal, notes = propose(clis, lead)
+    for note in notes:
+        print()
+        talk.say("note", note=note)
+    options = worker_options(clis, chosen, proposal["worker"])
+    if not options:
+        print()
+        talk.say("no_worker")
+        return 1
+    labels = [spec_label(spec, talk) + (talk.t("recommended") if spec == proposal["worker"] else "")
+              for spec in options]
+    worker = options[talk.choose(talk.t("worker_q"), labels, [1], why=talk.t("worker_why"))[0]]
+
+    allow = "claude" in chosen and talk.confirm(talk.t("allow_q"), True, why=talk.t("allow_why"))
+    rules = "codex" in chosen and talk.confirm(talk.t("rules_q"), True, why=talk.t("rules_why"))
+
+    names = talk.t("names")
+    yes_no = lambda value: talk.t("v_yes" if value else "v_no")
+    print()
+    talk.say("summary")
+    talk.say("s_leaders", v=", ".join(names[n] for n in chosen))
+    talk.say("s_scope", v=talk.t("s_global") if scope == "user" else talk.t("s_local", root=root))
+    talk.say("s_worker", v=spec_label(worker, talk))
+    if "claude" in chosen:
+        talk.say("s_allow", v=yes_no(allow))
+    if "codex" in chosen:
+        talk.say("s_rules", v=yes_no(rules))
+    if not talk.confirm(f"\n{talk.t('apply_q')}", True):
+        talk.say("nothing")
+        return 1
+
+    print()
+    path = save_config({"version": 2, "leader": lead, "language": talk.lang, "worker": worker},
+                       scope, root)
+    talk.say("saved", path=path)
+    if "claude" in chosen:
+        print("\nClaude Code:")
+        install_claude(scope, root, talk)
+        if allow:
+            try:
+                print("  " + allow_rules())
+            except PirloError as error:
+                print(f"  {error}")
+    if "codex" in chosen:
+        print("\nCodex:")
+        install_codex(talk, rules)
+    if "other" in chosen:
+        print(f"\n{names['other'][0].upper()}{names['other'][1:]}:")
+        install_other(scope, root, talk)
+    print()
+    talk.say("done")
     return 0
 
 
@@ -1091,6 +1490,8 @@ def main(argv=None):
     p = sub.add_parser("propose", help="propose a worker from what is installed")
     p.add_argument("--leader", default="claude", help="the CLI you lead from: claude, codex, agy, kimi...")
     p.set_defaults(func=cmd_propose)
+    p = sub.add_parser("setup", help="interactive setup in the terminal")
+    p.set_defaults(func=cmd_setup)
     p = sub.add_parser("save", help="save a config read from stdin")
     p.add_argument("--scope", choices=("user", "local"), required=True)
     p.set_defaults(func=cmd_save)

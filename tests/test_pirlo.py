@@ -407,11 +407,96 @@ class LeaderSupport(PirloCase):
         bin_dir = Path(self.tmp.name) / "bin"
         skills = Path(self.tmp.name) / "skills"
         out = subprocess.run(["sh", str(ROOT / "install.sh")], capture_output=True, text=True,
-                             env=dict(self.env, PIRLO_BIN_DIR=str(bin_dir), PIRLO_SKILLS_DIR=str(skills)))
+                             env=dict(self.env, PIRLO_BIN_DIR=str(bin_dir), PIRLO_SKILLS_DIR=str(skills),
+                                      PIRLO_NO_SETUP="1"))
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(os.access(bin_dir / "pirlo", os.X_OK))
         self.assertTrue((skills / "pirlo" / "SKILL.md").is_file())
         self.assertIn("add", out.stdout)
+
+
+class Setup(PirloCase):
+    def setup_run(self, answers, cwd=None, lang="1"):
+        return self.pirlo("setup", stdin="\n".join([lang] + answers) + "\n", cwd=cwd, PIRLO_MARKETPLACE="/market")
+
+    def test_claude_and_codex_local(self):
+        out = self.setup_run(["1,2", "2", "", "", "", ""])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("sandbox", out.stdout)
+        argvs = [(c["cli"], c["argv"]) for c in self.calls()]
+        self.assertIn(("claude", ["plugin", "install", "pirlo", "--marketplace", "/market", "--scope", "local"]), argvs)
+        self.assertIn(("codex", ["plugin", "marketplace", "add", "/market"]), argvs)
+        self.assertIn(("codex", ["plugin", "add", "pirlo@pirlo"]), argvs)
+        config = json.loads((self.repo / ".pirlo" / "config.json").read_text())
+        self.assertEqual((config["worker"], config["scope"]), (AUTHOR_WORKER, "local"))
+        rules = (self.home / ".codex" / "rules" / "pirlo.rules").read_text()
+        self.assertEqual(rules, (ROOT / "portable" / "pirlo.rules").read_text())
+        allow = json.loads((self.home / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+        self.assertIn("Bash(pirlo digest*)", allow)
+
+    def test_global_scope_and_picking_another_worker(self):
+        out = self.setup_run(["1", "1", "2", "n", ""])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
+        self.assertEqual((config["worker"], config["scope"]), ({"cli": "native"}, "user"))
+        install = [c["argv"] for c in self.calls() if c["argv"][:2] == ["plugin", "install"]]
+        self.assertEqual(install[0][-2:], ["--scope", "user"])
+        self.assertFalse((self.home / ".claude" / "settings.json").exists())
+
+    def test_nothing_changes_when_declined(self):
+        out = self.setup_run(["1,2", "2", "", "", "", "n"])
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("Nada foi alterado", out.stdout)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.repo / ".pirlo").exists())
+        self.assertFalse((self.home / ".config" / "pirlo").exists())
+
+    def test_other_lead_in_this_repo_uses_agents_md(self):
+        out = self.setup_run(["3", "2", "", ""])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("| pirlo digest", (self.repo / "AGENTS.md").read_text())
+        self.assertIn("/AGENTS.md", (self.repo / ".git" / "info" / "exclude").read_text())
+        self.setup_run(["3", "2", "", ""])
+        self.assertEqual((self.repo / "AGENTS.md").read_text().count("# pirlo"), 1)
+
+    def test_other_lead_outside_a_repo_installs_skills(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        skills = Path(self.tmp.name) / "skills"
+        out = self.setup_run(["3", "", "", str(skills)], cwd=outside)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("global", out.stdout)
+        for name in ("pirlo", "pirlo-setup", "pirlo-savings"):
+            self.assertTrue((skills / name / "SKILL.md").is_file())
+
+    def test_codex_rule_can_be_declined(self):
+        out = self.setup_run(["2", "1", "", "n", ""])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse((self.home / ".codex" / "rules" / "pirlo.rules").exists())
+        self.assertIn(("codex", ["plugin", "add", "pirlo@pirlo"]), [(c["cli"], c["argv"]) for c in self.calls()])
+
+    def test_english(self):
+        out = self.setup_run(["1", "1", "", "", ""], lang="2")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Which AIs do you want", out.stdout)
+        self.assertIn("Done.", out.stdout)
+        self.assertNotIn("Pronto", out.stdout)
+        config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
+        self.assertEqual(config["language"], "en")
+
+    def test_both_languages_have_the_same_messages(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("pirlo_cli", str(PIRLO))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("pirlo_cli", loader))
+        loader.exec_module(module)
+        self.assertEqual(set(module.TEXT["pt"]), set(module.TEXT["en"]))
+        self.assertEqual(module.CODEX_RULES, (ROOT / "portable" / "pirlo.rules").read_text())
+
+    def test_invalid_answer_asks_again(self):
+        out = self.setup_run(["9", "1", "1", "", "", ""])
+        self.assertIn("Opção inválida", out.stdout)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
 
 class Hook(PirloCase):

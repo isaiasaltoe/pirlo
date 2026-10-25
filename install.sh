@@ -1,9 +1,10 @@
 #!/bin/sh
-# Installs the pirlo command on Linux, WSL or macOS, so any agent CLI can call it.
-# Run it again to update. Optional settings:
+# Installs the pirlo command on Linux, WSL or macOS, then runs `pirlo setup`, which asks
+# in the terminal which AIs to use, the scope and the worker. Run it again to update.
+# Optional settings:
 #   PIRLO_BIN_DIR     where the command goes (default: ~/.local/bin)
-#   PIRLO_SKILLS_DIR  also install the skills there, for CLIs that read Agent Skills,
-#                     such as ~/.agents/skills
+#   PIRLO_SKILLS_DIR  also install the skills there, for CLIs that read Agent Skills
+#   PIRLO_NO_SETUP    set to skip the setup questions
 set -eu
 
 repo="https://raw.githubusercontent.com/isaiasaltoe/pirlo/main"
@@ -14,7 +15,7 @@ command -v python3 >/dev/null 2>&1 || { echo "pirlo needs python3 (3.9 or newer)
 
 # Copy from this clone when run from one, else download (curl ... | sh).
 fetch() {
-  if [ -n "$here" ] && [ -f "$here/$1" ]; then
+  if [ -n "$here" ] && [ -f "$here/install.sh" ] && [ -f "$here/$1" ]; then
     cp "$here/$1" "$2"
   elif command -v curl >/dev/null 2>&1; then
     curl -fsSL "$repo/$1" -o "$2"
@@ -36,6 +37,14 @@ if [ -n "${PIRLO_SKILLS_DIR:-}" ]; then
     fetch "portable/skills/$skill/SKILL.md" "$PIRLO_SKILLS_DIR/$skill/SKILL.md"
   done
   echo "installed the skills in $PIRLO_SKILLS_DIR"
+fi
+
+# With curl | sh, stdin is this script, so the questions read from the terminal itself.
+if [ -z "${PIRLO_NO_SETUP:-}" ] && { : </dev/tty; } 2>/dev/null; then
+  echo
+  "$bin_dir/pirlo" setup </dev/tty || true
+else
+  echo "next: run 'pirlo setup' in a terminal"
 fi
 
 case ":$PATH:" in

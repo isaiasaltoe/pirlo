@@ -4,7 +4,7 @@ Faz o agente que você usa (o **líder**) passar o trabalho braçal para um **wo
 
 O nome é uma homenagem ao Andrea Pirlo, que controlava o meio-campo: recebia a bola, decidia e distribuía.
 
-Funciona no Linux, no WSL e no macOS, com qualquer IA de terminal como líder: Claude Code e Codex têm plugin, e as outras usam uma skill ou um bloco no `AGENTS.md`.
+Funciona no Linux, no WSL e no macOS, com qualquer IA de terminal como líder: Claude Code e Codex têm plugin, e as outras usam uma skill ou um bloco no `AGENTS.md`. Um comando instala, e um setup no terminal faz as perguntas.
 
 ## Por que isso economiza
 
@@ -50,90 +50,46 @@ Se a saída for curta (até 2.500 caracteres), o pirlo nem chama o worker e devo
 
 ## Instalação
 
-Precisa de Python 3.9 ou mais novo. O pirlo só usa a biblioteca padrão.
-
-### Claude Code
-
-Em todos os repositórios:
-
-```bash
-claude plugin install pirlo --marketplace isaiasaltoe/pirlo --scope user
-```
-
-Só no repositório atual (rode na pasta do projeto):
-
-```bash
-claude plugin install pirlo --marketplace isaiasaltoe/pirlo --scope local
-```
-
-O escopo `local` grava em `.claude/settings.local.json`, que não vai para o git. No Claude Code, o comando `pirlo` entra no PATH sozinho enquanto o plugin está ativo.
-
-### Codex
-
-```bash
-codex plugin marketplace add isaiasaltoe/pirlo
-codex plugin add pirlo@pirlo
-curl -fsSL https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/install.sh | sh
-```
-
-O último comando põe o `pirlo` no PATH (`~/.local/bin`). No Codex, isso é necessário para a regra de permissão da seção [Codex e o sandbox](#codex-e-o-sandbox) funcionar.
-
-O Codex instala plugins para o usuário inteiro. Para usar só em um repositório, escolha o escopo `local` no setup: os outros repositórios ficam inativos.
-
-### Qualquer outra IA como líder
-
-Primeiro, instale o comando:
+Precisa de Python 3.9 ou mais novo (o pirlo só usa a biblioteca padrão) e roda no Linux, no WSL e no macOS. Na pasta do projeto, rode:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/install.sh | sh
 ```
 
-Depois, ensine o líder a delegar. Há dois jeitos:
+O comando põe o `pirlo` em `~/.local/bin` e abre o setup no terminal. O setup começa perguntando o idioma (português ou inglês) e explica cada pergunta antes de você responder:
 
-- **Se o CLI lê skills** no padrão [Agent Skills](https://agentskills.io) (`SKILL.md`), instale as skills na pasta dele:
+1. **Líderes:** em quais IAs você quer usar o pirlo (Claude Code, Codex, outra). Antes, ele mostra quais IAs estão instaladas e logadas. Essa detecção **não gasta cota**: usa `claude auth status`, `codex login status`, `codex debug models` (o catálogo local) e `agy models`;
+2. **Escopo:** global (todos os repositórios) ou local (só o repositório em que você está). A configuração local fica em `.pirlo/`, fora do git;
+3. **Worker:** qual IA faz o trabalho braçal. O setup recomenda uma, de preferência numa assinatura diferente da do líder, e lista as outras que encontrou;
+4. **Permissões do Claude Code:** se pode liberar os comandos de leitura do pirlo sem pedir aprovação (veja [Permissões](#permissões));
+5. **Regra do Codex:** se pode gravar a regra que deixa o pirlo sair do sandbox do Codex (veja [Codex e o sandbox](#codex-e-o-sandbox)).
 
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/install.sh | PIRLO_SKILLS_DIR=~/.agents/skills sh
-  ```
+No fim, o setup mostra um resumo e só aplica se você confirmar. Ao aplicar, ele faz a instalação em cada IA:
 
-  Troque `~/.agents/skills` pela pasta de skills do seu CLI. Uma skill só coloca a descrição no contexto, então é o jeito mais barato.
+| Líder | O que o setup faz |
+| --- | --- |
+| Claude Code | `claude plugin install pirlo --marketplace isaiasaltoe/pirlo --scope user` ou `--scope local`, conforme o escopo |
+| Codex | `codex plugin marketplace add isaiasaltoe/pirlo`, `codex plugin add pirlo@pirlo` e, se você aceitar, a regra do sandbox |
+| Outra IA, escopo local | adiciona as instruções do pirlo ao `AGENTS.md` do projeto e deixa o arquivo fora dos seus commits |
+| Outra IA, escopo global | instala as skills (`SKILL.md`) na pasta que você indicar, para CLIs que leem skills |
 
-- **Se o CLI lê `AGENTS.md`**, ponha as instruções do pirlo nele, na pasta do projeto:
+Para mudar alguma resposta depois, rode `pirlo setup` de novo. Para atualizar o pirlo, rode o comando de instalação de novo. No Claude Code também existe o `/pirlo:setup`, que faz as mesmas perguntas dentro da sessão.
 
-  ```bash
-  pirlo instructions >> AGENTS.md
-  echo "/AGENTS.md" >> .git/info/exclude
-  ```
+**Por que o escopo é uma pergunta do setup, e não uma opção do comando de instalação?** O comando de instalação é o mesmo para todo mundo. Quem decide onde o pirlo fica ativo é você, respondendo no terminal, e o setup traduz a resposta para o formato de cada IA. O Claude Code tem escopo de plugin. O Codex não tem, então o pirlo fica desligado nos repositórios sem configuração local.
 
-  O segundo comando deixa o `AGENTS.md` fora dos seus commits. Para valer em todos os projetos, ponha o bloco no arquivo global do seu CLI.
+**Por que um worker só, e não vários níveis?** O que se delega já é, por definição, trabalho de pouca decisão: planejamento, arquitetura, design e decisões ficam sempre com o líder. Vários níveis só criariam mais uma escolha para o líder errar, mais perguntas no setup e mais texto no contexto em toda sessão.
 
-Para atualizar o `pirlo`, rode o `install.sh` de novo.
-
-## Setup
-
-No Claude Code, rode `/pirlo:setup`. Nos outros líderes, peça "configure o pirlo".
-
-O setup:
-
-1. detecta quais CLIs estão instalados e logados (`claude`, `agy`, `codex`) e lista os modelos de cada um. **Não gasta cota**: usa `claude auth status`, `codex login status`, `codex debug models` (o catálogo local) e `agy models`;
-2. propõe um worker, de preferência numa assinatura diferente da do líder, para poupar a cota dele, e deixa você trocar;
-3. pergunta o escopo: todos os repositórios (`~/.config/pirlo/config.json`) ou só este (`.pirlo/config.json`, fora do git);
-4. no Claude Code, pergunta se pode liberar os comandos de leitura do pirlo sem pedir aprovação (veja [Permissões](#permissões));
-5. salva a configuração.
-
-Propostas para combinações comuns:
+### Workers propostos
 
 | Você tem | Líder | Worker proposto |
 | --- | --- | --- |
 | Claude + Google AI Pro | Claude Code | `agy` com `gemini-3.8-flash-medium` |
 | Claude + ChatGPT | Claude Code | `codex` com o modelo menor, esforço `medium` |
-| Só Claude | Claude Code | `native`: o próprio subagente `pirlo:worker`, em Haiku. Funciona sem setup |
+| Só Claude | Claude Code | `native`: o próprio subagente `pirlo:worker`, em Haiku |
 | Só Codex | Codex | `codex exec` com o modelo menor, em sandbox `read-only` |
 | Google AI Pro + ChatGPT | Antigravity | `codex` com o modelo menor |
 
 Os IDs dos modelos nunca ficam fixos no código: vêm do que cada CLI lista na sua máquina.
-
-**Por que um worker só, e não vários níveis?** O que se delega já é, por definição, trabalho de pouca decisão: planejamento, arquitetura, design e decisões ficam sempre com o líder. Vários níveis só criariam mais uma escolha para o líder errar, mais perguntas no setup e mais texto no contexto em toda sessão.
 
 ## Uso
 
@@ -175,9 +131,11 @@ Para respeitar outros plugins pedagógicos ou restritivos, adicione o nome deles
 
 ## Permissões
 
+O setup pergunta sobre as duas coisas abaixo e explica cada uma. Esta seção é a versão longa.
+
 ### Claude Code
 
-O setup oferece rodar `pirlo allow`, que adiciona em `~/.claude/settings.json`:
+O Claude Code pede aprovação antes de rodar comandos. Se você aceitar no setup, ele adiciona em `~/.claude/settings.json`:
 
 ```json
 {
@@ -193,20 +151,19 @@ O setup oferece rodar `pirlo allow`, que adiciona em `~/.claude/settings.json`:
 }
 ```
 
-Esses comandos só leem, então liberar é seguro. O comando que vem antes do pipe (`bin/rails test`, `npm test`...) continua seguindo as suas regras de sempre. O `pirlo edit` continua pedindo aprovação, porque altera arquivos.
+Esses comandos só leem e pedem um resumo ao worker, então liberar é seguro. O comando que vem antes do pipe (`bin/rails test`, `npm test`...) continua seguindo as suas regras de sempre. O `pirlo edit` continua pedindo aprovação, porque altera arquivos. Para fazer isso sem o setup, rode `pirlo allow`.
 
 ### Codex e o sandbox
 
-No Codex, todo comando roda num sandbox que, por padrão, **bloqueia a rede**. O problema é que o pirlo precisa de rede: ele chama outro CLI (`agy`, `codex`...), que conversa com os servidores da Anthropic, do Google ou da OpenAI. Dentro do sandbox, essa chamada falha. O Codex então pede para rodar o comando fora do sandbox, e você aprovaria isso a cada delegação.
+No Codex, todo comando roda num sandbox que, por padrão, **bloqueia a internet**. O pirlo precisa de internet: ele chama outro CLI (`agy`, `codex`...), que conversa com os servidores do Google, da OpenAI ou da Anthropic. Dentro do sandbox essa chamada falha, e o Codex pede para rodar o comando fora dele. Sem nada configurado, isso aconteceria a cada delegação.
 
-O Codex tem um mecanismo para isso, as **regras** (arquivos `.rules`). Um comando que casa com uma regra `allow` roda fora do sandbox sem perguntar. O pirlo traz uma regra pronta, que libera só os comandos de leitura:
+O Codex resolve isso com **regras** (arquivos `.rules`): um comando que casa com uma regra `allow` roda fora do sandbox sem perguntar. Se você aceitar no setup, ele grava `~/.codex/rules/pirlo.rules`, que libera só os comandos de leitura do pirlo:
 
-```bash
-mkdir -p ~/.codex/rules
-curl -fsSL https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/portable/pirlo.rules -o ~/.codex/rules/pirlo.rules
+```python
+prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show"]], decision = "allow")
 ```
 
-A regra só casa quando o comando começa com `pirlo`, por isso o `install.sh` é necessário no Codex. Para conferir, rode:
+Os comandos do seu projeto continuam no sandbox. Para conferir a regra:
 
 ```bash
 codex execpolicy check --rules ~/.codex/rules/pirlo.rules pirlo digest
@@ -217,7 +174,7 @@ O resultado deve ser `"decision":"allow"`.
 Dois limites, segundo as instruções do próprio Codex:
 
 - o Codex avalia cada lado do pipe separadamente, mas **não compara com as regras** comandos com redirecionamento (`>`, `<`). O `2>&1` de `npm test 2>&1 | pirlo digest` pode cair nesse caso e voltar a pedir aprovação;
-- o lado do pipe com o seu comando (`npm test`) segue as regras e o sandbox normais do Codex.
+- a regra só casa quando o comando começa com `pirlo`, por isso o `pirlo` precisa estar no PATH (o comando de instalação cuida disso).
 
 Isso não foi testado com uma conta logada. Se o Codex continuar pedindo aprovação, aprove com a opção de lembrar a regra.
 
@@ -307,7 +264,8 @@ A primeira versão foi feita numa máquina sem o `agy` e sem as contas do autor.
 
 - o `agy` foi testado só com um CLI falso que imita a saída descrita no `agy --help`. O formato exato do `--output-format json` e da lista do `agy models` precisa ser confirmado na máquina real. Se não bater, o pirlo ainda devolve o texto, mas pode não ler o uso de tokens;
 - o `codex exec` e a regra do Codex foram conferidos no `codex` 0.164, mas nunca rodaram com uma conta logada;
-- o `claude -p` como worker, a delegação automática no Claude Code e o pipe usando as permissões da sessão foram testados de verdade.
+- o `claude -p` como worker, a delegação automática no Claude Code e o pipe usando as permissões da sessão foram testados de verdade;
+- o setup foi testado de verdade num terminal, instalando o plugin no `claude` e no `codex` reais, mas com o marketplace apontando para uma cópia local. A instalação a partir do GitHub (`curl ... | sh` e `--marketplace isaiasaltoe/pirlo`) só funciona com o repositório público.
 
 Para conferir na sua máquina:
 
