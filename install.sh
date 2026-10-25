@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs the pirlo command on Linux, WSL or macOS, then runs `pirlo setup`, which asks
-# in the terminal which AIs to use, the scope and the worker. Run it again to update.
+# in the terminal which AIs to use, in leadership order, and the scope. Run it again to update.
 # Optional settings:
 #   PIRLO_BIN_DIR     where the command goes (default: ~/.local/bin)
 #   PIRLO_SKILLS_DIR  also install the skills there, for CLIs that read Agent Skills
