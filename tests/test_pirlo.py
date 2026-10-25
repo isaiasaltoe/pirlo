@@ -707,6 +707,14 @@ class Setup(PirloCase):
         self.assertIn("Gemini CLI", out.stdout)
         self.assertIn("# pirlo", (self.repo / "GEMINI.md").read_text())
 
+    def test_jersey_and_thanks_only_on_the_first_setup(self):
+        out = self.setup_run(["1", "1", "", ""])
+        self.assertIn("P I R L O", out.stdout)
+        self.assertIn("Obrigado por usar o pirlo", out.stdout)
+        self.assertIn("https://altoe.dev", out.stdout)
+        again = self.setup_run(["1", "1", "", ""])
+        self.assertNotIn("P I R L O", again.stdout)
+
     def test_invalid_answer_asks_again(self):
         out = self.setup_run(["9", "1", "1", "", ""])
         self.assertIn("Opção inválida", out.stdout)

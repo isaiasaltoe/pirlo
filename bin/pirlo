@@ -1670,9 +1670,27 @@ CODEX_RULES = """# Codex rules: let pirlo's read-only commands run outside the s
 # so they can reach the worker CLIs over the network. pirlo edit keeps asking.
 prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show", "passe"]], decision = "allow")
 """
+# Shown once, on the first setup: Pirlo's number 21, on the back of the shirt.
+JERSEY = r"""
+       ______          ______
+   ___/      \________/      \___
+  /                              \
+ /___                          ___\
+     |       P I R L O        |
+     |                        |
+     |        ____   _        |
+     |       |___ \ / |       |
+     |         __) || |       |
+     |        / __/ | |       |
+     |       |_____||_|       |
+     |                        |
+     |________________________|
+"""
 TEXT = {
     "pt": {
         "title": "pirlo setup",
+        "welcome": "Obrigado por usar o pirlo! Se quiser mandar feedback, uma ideia ou um bug, é só "
+                   "falar comigo: https://altoe.dev",
         "detecting": "Procurando as IAs instaladas (sem gastar cota)...",
         "not_installed": "não instalado", "logged_in": "logado",
         "logged_out": "instalado, mas NÃO logado (faça login antes)", "installed": "instalado",
@@ -1745,6 +1763,8 @@ TEXT = {
     },
     "en": {
         "title": "pirlo setup",
+        "welcome": "Thanks for using pirlo! For feedback, ideas or bugs, get in touch: "
+                   "https://altoe.dev",
         "detecting": "Looking for installed AIs (spends no quota)...",
         "not_installed": "not installed", "logged_in": "logged in",
         "logged_out": "installed but NOT logged in (log in first)", "installed": "installed",
@@ -2000,7 +2020,11 @@ def install_other(scope, root, talk, files):
 
 
 def cmd_setup(args):
+    first = not user_config_path().exists()
     talk = pick_language()
+    if first:
+        print(JERSEY)
+        talk.say("welcome")
     root = repo_root(os.getcwd())
     in_repo = (Path(root) / ".git").exists()
     config, _, _ = load_config(root)
