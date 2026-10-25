@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 470" width="880" height="470" role="img" aria-labelledby="t d">
   <title id="t">Como o pirlo funciona</title>
-  <desc id="d">Você conversa com o líder. O líder roda o comando e manda a saída ao pirlo, ou pede uma leitura. O pirlo devolve saídas curtas direto e manda o resto para a fila de workers, que troca de marca quando uma fica sem cota. O worker devolve um resumo com arquivo:linha. Quando a cota do líder acaba, o pirlo deixa um passe pronto para outra IA.</desc>
+  <desc id="d">Você conversa com o líder. O líder roda os testes e manda a saída ao pirlo, ou pede para rastrear algo no código. O pirlo devolve saídas curtas direto e manda o resto para a fila de workers, que troca de marca quando uma fica sem cota. O worker devolve um resumo com as falhas em arquivo:linha. Quando a cota do líder acaba, o pirlo deixa um passe pronto para outra IA.</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#475569"/>
@@ -13,8 +13,11 @@
       .h { font-size: 17px; font-weight: 700; }
       .s { font-size: 13px; fill: #334155; }
       .m { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #1e293b; }
+      .t { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #e2e8f0; }
+      .p { fill: #7dd3fc; }
+      .c { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #86efac; }
+      .r { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; fill: #14532d; }
       .l { font-size: 12.5px; fill: #475569; }
-      .ok { font-size: 12.5px; fill: #15803d; font-weight: 600; }
       .box { stroke-width: 1.5; }
       .line { stroke: #475569; stroke-width: 1.8; fill: none; }
       .back { stroke: #15803d; stroke-width: 1.8; fill: none; stroke-dasharray: 6 5; }
@@ -26,7 +29,7 @@
   <!-- você -->
   <rect class="box" x="30" y="60" width="120" height="70" rx="12" fill="#ffffff" stroke="#94a3b8"/>
   <text class="h" x="90" y="92" text-anchor="middle">você</text>
-  <text class="s" x="90" y="113" text-anchor="middle">escreve normal</text>
+  <text class="s" x="90" y="113" text-anchor="middle">"roda os testes"</text>
   <path class="line" d="M150 95 H 205" marker-end="url(#a)"/>
 
   <!-- líder -->
@@ -36,45 +39,54 @@
   <text class="s" x="315" y="110" text-anchor="middle">Antigravity, Kimi...</text>
   <text class="s" x="315" y="134" text-anchor="middle">planeja e decide</text>
 
-  <!-- pedidos do líder -->
-  <path class="line" d="M420 75 H 485" marker-end="url(#a)"/>
-  <path class="line" d="M420 115 H 485" marker-end="url(#a)"/>
-  <rect class="box" x="490" y="30" width="360" height="130" rx="12" fill="#eef4ff" stroke="#1d4ea0"/>
-  <text class="h" x="510" y="56" fill="#1d4ea0">pirlo</text>
-  <text class="m" x="510" y="82">npm test 2&gt;&amp;1 | pirlo digest</text>
-  <text class="l" x="510" y="99">o líder roda, com as permissões dele</text>
-  <text class="m" x="510" y="124">pirlo ask "o que o PDF diz de X?"</text>
-  <text class="ok" x="510" y="147">saída curta? volta direto, sem worker</text>
+  <!-- terminal do pirlo -->
+  <path class="line" d="M420 95 H 485" marker-end="url(#a)"/>
+  <rect x="490" y="26" width="370" height="140" rx="10" fill="#0f172a"/>
+  <path d="M490 36 a10 10 0 0 1 10 -10 h350 a10 10 0 0 1 10 10 v16 h-370 z" fill="#1e293b"/>
+  <circle cx="506" cy="39" r="5" fill="#f87171"/>
+  <circle cx="522" cy="39" r="5" fill="#fbbf24"/>
+  <circle cx="538" cy="39" r="5" fill="#4ade80"/>
+  <text class="t" x="675" y="43" text-anchor="middle" fill-opacity="0.8">pirlo</text>
+  <text class="t" x="506" y="78"><tspan class="p">$</tspan> bin/rails test 2&gt;&amp;1 | pirlo digest</text>
+  <text class="t" x="506" y="104"><tspan class="p">$</tspan> pirlo ask "onde o login valida o token?"</text>
+  <text class="c" x="506" y="134"># saída curta? volta direto, sem worker</text>
+  <text class="c" x="506" y="153"># o resto vai para a fila de workers</text>
 
   <!-- fila de workers -->
-  <path class="line" d="M670 160 V 205" marker-end="url(#a)"/>
-  <rect class="box" x="300" y="210" width="550" height="120" rx="12" fill="#ffffff" stroke="#94a3b8"/>
+  <path class="line" d="M675 166 V 205" marker-end="url(#a)"/>
+  <rect class="box" x="300" y="210" width="560" height="120" rx="12" fill="#ffffff" stroke="#94a3b8"/>
   <text class="h" x="320" y="236">fila de workers, uma marca por vez</text>
   <text class="l" x="320" y="255">CLIs oficiais, só leitura</text>
+  <text class="l" x="840" y="236" text-anchor="end">sem cota? passa para o próximo</text>
 
-  <rect x="320" y="270" width="130" height="40" rx="9" fill="#fff4e0" stroke="#f5a524"/>
-  <text class="m" x="385" y="295" text-anchor="middle">agy · Gemini</text>
-  <path class="line" d="M450 290 H 485" marker-end="url(#a)"/>
-  <rect x="490" y="270" width="130" height="40" rx="9" fill="#e7f8ef" stroke="#34c27a"/>
-  <text class="m" x="555" y="295" text-anchor="middle">codex · GPT</text>
-  <path class="line" d="M620 290 H 655" marker-end="url(#a)"/>
-  <rect x="660" y="270" width="170" height="40" rx="9" fill="#fdecec" stroke="#e45b5b"/>
-  <text class="m" x="745" y="295" text-anchor="middle">native · Haiku</text>
-  <text class="l" x="575" y="255" text-anchor="middle">sem cota? passa para o próximo</text>
+  <rect x="320" y="270" width="140" height="40" rx="9" fill="#fff4e0" stroke="#f5a524"/>
+  <text class="m" x="390" y="295" text-anchor="middle">agy · Gemini</text>
+  <path class="line" d="M460 290 H 495" marker-end="url(#a)"/>
+  <rect x="500" y="270" width="140" height="40" rx="9" fill="#e7f8ef" stroke="#34c27a"/>
+  <text class="m" x="570" y="295" text-anchor="middle">codex · GPT</text>
+  <path class="line" d="M640 290 H 675" marker-end="url(#a)"/>
+  <rect x="680" y="270" width="160" height="40" rx="9" fill="#fdecec" stroke="#e45b5b"/>
+  <text class="m" x="760" y="295" text-anchor="middle">native · Haiku</text>
 
-  <!-- volta -->
-  <path class="back" d="M300 270 H 260 V 155" marker-end="url(#g)"/>
-  <text class="ok" x="140" y="215">resumo curto com</text>
-  <text class="ok" x="140" y="233">arquivo:linha</text>
+  <!-- resposta que volta ao líder -->
+  <path class="back" d="M300 290 H 268" marker-end="url(#g)"/>
+  <rect x="30" y="178" width="236" height="152" rx="10" fill="#ecfdf3" stroke="#15803d" stroke-width="1.5"/>
+  <text class="r" x="44" y="202" font-weight="700">2 falhas:</text>
+  <text class="r" x="44" y="223">test/auth_test.rb:42</text>
+  <text class="r" x="58" y="241">esperava 200, veio 302</text>
+  <text class="r" x="44" y="262">app/models/user.rb:17</text>
+  <text class="r" x="58" y="280">token nil no login</text>
+  <text class="r" x="44" y="312" fill-opacity="0.75">[pirlo: agy flash, 8.1s]</text>
+  <path class="back" d="M232 178 V 156" marker-end="url(#g)"/>
 
   <!-- rodapé: log e passe -->
-  <rect x="30" y="360" width="400" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+  <rect x="30" y="360" width="405" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
   <text class="h" x="50" y="388">log e economia</text>
   <text class="s" x="50" y="410">cada delegação vira uma linha em usage.jsonl;</text>
   <text class="s" x="50" y="428">pirlo savings estima o que o líder não leu</text>
 
-  <rect x="450" y="360" width="400" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-  <text class="h" x="470" y="388">passe</text>
-  <text class="s" x="470" y="410">a cota do líder acabou? .pirlo/passe.md fica pronto</text>
-  <text class="s" x="470" y="428">e a próxima IA continua de onde parou</text>
+  <rect x="455" y="360" width="405" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="h" x="475" y="388">passe</text>
+  <text class="s" x="475" y="410">a cota do líder acabou? .pirlo/passe.md fica pronto</text>
+  <text class="s" x="475" y="428">e a próxima IA continua de onde parou</text>
 </svg>

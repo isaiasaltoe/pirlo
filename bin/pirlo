@@ -46,7 +46,7 @@ LARGE_WORDS = ("opus", "ultra", "astra", "sol", "pro", "max")
 HOME_PREFIX = {"agy": "gemini", "codex": "gpt", "claude": ""}
 ERROR_LINE = re.compile(
     r"error|fail|exception|traceback|warning|undefined|cannot|can't|not found|missing|"
-    r"expected|assert|panic|fatal|denied|overfull|underfull|\?\?|^!",
+    r"expected|assert|panic|fatal|denied|not ok|npm err!|[✗✕×]|^E\s{2,}",
     re.IGNORECASE,
 )
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -57,9 +57,11 @@ LEADER_INSTRUCTIONS = """# pirlo
 
 Hand bulky, low-judgment work to a cheaper worker with the `pirlo` command instead of doing it \
 yourself, so you never read raw material:
-- Tests, builds, linters or LaTeX: run the command yourself and pipe its output to pirlo: \
+- Test suites, builds, type checks, linters or CI logs: run the command yourself and pipe its \
+output to pirlo: \
 `<command> 2>&1 | pirlo digest --label "<command>" --task "what to look for"`
-- Read docs, PDFs or many files, or search widely, to answer a narrow question: \
+- Trace code across many files, or read dependency source, a large diff or git history, to answer \
+a narrow question: \
 `pirlo ask "<self-contained task with paths and the question>"`
 - A mechanical edit the user asked for (rename, format, repeat a pattern): `pirlo edit "<task>"`
 
@@ -1462,9 +1464,10 @@ def cmd_hook(args):
     except Exception:  # a hook must never break the session
         return 0
     text = ("pirlo is on in this repository. To save your quota, hand bulky low-judgment work to "
-            "the pirlo:worker subagent instead of doing it yourself: running tests, builds, "
-            "linters or LaTeX; reading long logs, docs, PDFs or many files to answer a narrow "
-            "question; wide code searches. Give it one self-contained task; it answers with "
+            "the pirlo:worker subagent instead of doing it yourself: running test suites, builds, "
+            "type checks, linters or CI logs; tracing code across many files; reading dependency "
+            "source, large diffs or git history to answer a narrow question. Give it one "
+            "self-contained task; it answers with "
             "path:line references. Independent tasks can go to several workers in parallel. "
             "Keep planning, design, decisions and small edits yourself.")
     if found:
@@ -1532,7 +1535,8 @@ TEXT = {
         "invalid": "  Opção inválida.", "yes_no": "(s/n)", "yes": "s", "no": "n",
         "leaders_q": "Em quais IAs você quer usar o pirlo como líder?",
         "leaders_why": "O líder é a IA que você usa no dia a dia. O pirlo ensina essa IA a passar o "
-                       "trabalho braçal (rodar testes, ler logs, docs e PDFs, buscas amplas) para "
+                       "trabalho braçal (rodar testes, build e lint, ler logs de CI, rastrear código "
+                       "em vários arquivos) para "
                        "outra mais barata, sem você pedir.",
         "other": "Outra IA não listada (usa AGENTS.md)",
         "missing": " (não instalado)",
@@ -1600,7 +1604,8 @@ TEXT = {
         "invalid": "  Invalid option.", "yes_no": "(y/n)", "yes": "y", "no": "n",
         "leaders_q": "Which AIs do you want to use pirlo with as the lead?",
         "leaders_why": "The lead is the AI you use every day. pirlo teaches it to hand bulky work "
-                       "(running tests, reading logs, docs and PDFs, wide searches) to a cheaper "
+                       "(running tests, builds and linters, reading CI logs, tracing code across "
+                       "files) to a cheaper "
                        "one, without you asking.",
         "other": "Another AI not listed (uses AGENTS.md)",
         "missing": " (not installed)",

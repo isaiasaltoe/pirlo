@@ -4,7 +4,7 @@
 
 # pirlo
 
-Faz o agente que você usa (o **líder**) passar o trabalho braçal para **workers mais baratos**, sem você chamar nenhum comando, e troca sozinho de IA quando uma fica sem cota. O líder continua pensando: planeja, decide e escreve o código que importa. O worker roda testes, lê logs longos, documentação e PDFs e faz buscas amplas, e devolve só um resumo curto com referências `arquivo:linha`.
+Faz o agente que você usa (o **líder**) passar o trabalho braçal para **workers mais baratos**, sem você chamar nenhum comando, e troca sozinho de IA quando uma fica sem cota. O líder continua pensando: planeja, decide e escreve o código que importa. O worker lê a saída dos testes, do build e do CI, rastreia código por vários arquivos e lê o código das dependências, e devolve só um resumo curto com referências `arquivo:linha`.
 
 O nome é uma homenagem ao Andrea Pirlo, que controlava o meio-campo: recebia a bola, decidia e distribuía.
 
@@ -12,7 +12,7 @@ Funciona no Linux, no WSL e no macOS, com qualquer IA de terminal como líder: C
 
 ## Por que isso economiza
 
-A maior parte da cota não vai para o raciocínio do líder. Vai para o que ele **lê**: 30 mil tokens de log de teste para achar duas falhas, um PDF inteiro para achar um parágrafo. No pirlo, quem lê é um worker mais barato, num contexto separado, e o líder recebe só o resumo. É a mesma ideia do cookbook "plan big, execute small" da Anthropic: a economia vem de *quem lê*.
+A maior parte da cota não vai para o raciocínio do líder. Vai para o que ele **lê**: 30 mil tokens de log de teste para achar duas falhas, vinte arquivos abertos para descobrir onde um token é validado. No pirlo, quem lê é um worker mais barato, num contexto separado, e o líder recebe só o resumo. É a mesma ideia do cookbook "plan big, execute small" da Anthropic: a economia vem de *quem lê*.
 
 ## Como funciona
 
@@ -22,8 +22,8 @@ A maior parte da cota não vai para o raciocínio do líder. Vai para o que ele 
 
 | Comando | Para quê |
 | --- | --- |
-| `<comando> 2>&1 \| pirlo digest` | testes, build, lint, LaTeX: o worker lê a saída e devolve as falhas |
-| `pirlo ask "<tarefa>"` | ler arquivos, docs, PDFs, buscar no código, em modo só leitura |
+| `<comando> 2>&1 \| pirlo digest` | testes, build, type check, lint, log de CI: o worker lê a saída e devolve as falhas |
+| `pirlo ask "<tarefa>"` | rastrear código, ler o código de uma dependência, um diff grande ou o `git log`, em modo só leitura |
 | `pirlo edit "<tarefa>"` | edição mecânica pedida explicitamente (renomear, formatar, repetir um padrão) |
 
 ### Por que o líder roda o comando e o pirlo só lê a saída
@@ -113,8 +113,11 @@ Nos outros líderes, rode `pirlo passe` no terminal quando a cota acabar. Sem o 
 Você não faz nada: escreve normalmente.
 
 - "roda os testes e me diz o que quebrou": o líder roda os testes com `| pirlo digest`, e o worker devolve só as falhas com `arquivo:linha`;
-- "o que o capítulo 3 da referência X diz sobre Y?": o worker lê o PDF e responde em poucas linhas;
-- "o LaTeX deu erro, o que foi?": o líder compila, e o worker lê o log e aponta a linha.
+- "o CI quebrou, o que foi?": o líder roda `gh run view --log-failed | pirlo digest`, e o worker aponta o passo e a linha que falharam;
+- "o `tsc` está reclamando de quê?": o worker agrupa os erros de tipo por arquivo, com `arquivo:linha`;
+- "onde a gente valida o token do usuário?": o worker rastreia o código e responde com os pontos exatos;
+- "como essa lib faz o retry?": o worker lê o código da dependência em `node_modules` ou na pasta de gems e resume;
+- "o que mudou nessa branch desde a main?": o líder roda `git diff main... | pirlo digest`, e o worker resume as mudanças por arquivo.
 
 Para tarefas independentes, o líder pode chamar vários workers em paralelo.
 
@@ -222,7 +225,7 @@ Para você decidir com números:
 
 Por isso, para quem só tem Claude, o padrão é `native`: o subagente em Haiku sai bem mais barato que chamar `claude -p`.
 
-A delegação compensa quando há muito para ler: logs grandes, documentação, PDFs, buscas amplas. Não compensa em design de landing page nem em edições pequenas e pontuais. A descrição do subagente diz isso ao líder.
+A delegação compensa quando há muito para ler: suítes de testes, logs de build e de CI, buscas amplas no código, código de dependências, diffs grandes. Não compensa em design de interface nem em edições pequenas e pontuais. A descrição do subagente diz isso ao líder.
 
 ## Configuração
 

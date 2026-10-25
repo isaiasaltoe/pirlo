@@ -13,7 +13,7 @@
   "interface": {
     "displayName": "pirlo",
     "shortDescription": "Hand bulky reading and test runs to cheaper worker CLIs.",
-    "longDescription": "The lead agent delegates test runs, long logs, docs and wide searches to a cheaper official CLI (Antigravity, Codex, Claude Code or any CLI) in read-only mode, gets a short answer with path:line references, and logs each delegation locally to estimate the savings.",
+    "longDescription": "The lead agent delegates test runs, builds, CI logs and wide code searches to a cheaper official CLI (Antigravity, Codex, Claude Code or any CLI) in read-only mode, gets a short answer with path:line references, and logs each delegation locally to estimate the savings.",
     "developerName": "isaiasaltoe",
     "category": "Productivity",
     "capabilities": ["Read"],
