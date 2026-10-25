@@ -22,14 +22,12 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.1.0"
-TIERS = ("cheap", "standard", "strong")
+VERSION = "0.2.0"
 BUILTIN_CLIS = ("agy", "codex", "claude")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULTS = {
-    "version": 1,
-    "tiers": {},
-    "commandTimeoutSeconds": 900,
+    "version": 2,
+    "worker": None,
     "workerTimeoutSeconds": 600,
     "maxReplyWords": 200,
     "maxReplyChars": 6000,
@@ -50,6 +48,24 @@ ERROR_LINE = re.compile(
     re.IGNORECASE,
 )
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# Read-only commands only: pirlo never runs the lead's commands, and edit keeps asking.
+ALLOW_RULES = ["Bash(pirlo ask *)", "Bash(pirlo digest*)", "Bash(pirlo savings*)",
+               "Bash(pirlo detect*)", "Bash(pirlo show*)"]
+LEADER_INSTRUCTIONS = """# pirlo
+
+Hand bulky, low-judgment work to a cheaper worker with the `pirlo` command instead of doing it \
+yourself, so you never read raw material:
+- Tests, builds, linters or LaTeX: run the command yourself and pipe its output to pirlo: \
+`<command> 2>&1 | pirlo digest --label "<command>" --task "what to look for"`
+- Read docs, PDFs or many files, or search widely, to answer a narrow question: \
+`pirlo ask "<self-contained task with paths and the question>"`
+- A mechanical edit the user asked for (rename, format, repeat a pattern): `pirlo edit "<task>"`
+
+Use the short reply as is and open only the path:line spots you must check. Independent tasks can \
+run as parallel commands. Keep planning, design, decisions and small edits yourself. If the reply \
+says PIRLO_FAILED or PIRLO_NATIVE, or pirlo is not set up, do the task yourself. If it says \
+PIRLO_RESTRICTED, a learning tool is active: never solve exercises or give fixes.
+"""
 
 
 class PirloError(Exception):
@@ -127,50 +143,39 @@ def load_config(root):
     for layer, name in ((user, "user"), (local, "local")):
         if not isinstance(layer, dict):
             continue
-        for key, value in layer.items():
-            if key == "tiers" and isinstance(value, dict):
-                config["tiers"].update(value)
-            else:
-                config[key] = value
+        config.update(layer)
         source = name
     # A user config with scope "local" means: only repositories with their own config.
     active = isinstance(local, dict) or not (isinstance(user, dict) and user.get("scope") == "local")
     return config, source, active
 
 
-def tier_spec(config, tier):
-    spec = config.get("tiers", {}).get(tier)
+def worker_spec(config):
+    spec = config.get("worker")
     if isinstance(spec, str):
         spec = {"cli": spec}
     if isinstance(spec, dict) and spec.get("cli"):
         return spec
     # Nothing configured: inside Claude Code the subagent itself is the worker.
-    if os.environ.get("CLAUDECODE") and not config.get("tiers"):
+    if os.environ.get("CLAUDECODE"):
         return {"cli": "native"}
-    raise PirloError(
-        f"tier '{tier}' is not configured; run the pirlo setup (/pirlo:setup in Claude Code)"
-    )
+    raise PirloError("no worker is configured; run the pirlo setup (/pirlo:setup in Claude Code)")
 
 
 def validate_config(data):
     if not isinstance(data, dict):
         raise PirloError("config must be a JSON object")
-    tiers = data.get("tiers", {})
-    if not isinstance(tiers, dict):
-        raise PirloError("tiers must be an object")
     adapters = data.get("adapters", {})
-    for name, spec in tiers.items():
-        if name not in TIERS:
-            raise PirloError(f"unknown tier '{name}' (use {', '.join(TIERS)})")
-        if isinstance(spec, str):
-            spec = {"cli": spec}
-        if not isinstance(spec, dict) or not spec.get("cli"):
-            raise PirloError(f"tier '{name}' needs a cli")
-        cli = spec["cli"]
-        if cli not in BUILTIN_CLIS + ("native",) and cli not in adapters:
-            raise PirloError(f"tier '{name}': unknown cli '{cli}' (add it under adapters)")
-        if spec.get("effort") and spec["effort"] not in EFFORTS:
-            raise PirloError(f"tier '{name}': effort must be one of {', '.join(EFFORTS)}")
+    spec = data.get("worker")
+    if isinstance(spec, str):
+        spec = {"cli": spec}
+    if not isinstance(spec, dict) or not spec.get("cli"):
+        raise PirloError('the config needs a worker, like {"worker": {"cli": "agy", "model": "..."}}')
+    cli = spec["cli"]
+    if cli not in BUILTIN_CLIS + ("native",) and cli not in adapters:
+        raise PirloError(f"unknown worker cli '{cli}' (add it under adapters)")
+    if spec.get("effort") and spec["effort"] not in EFFORTS:
+        raise PirloError(f"effort must be one of {', '.join(EFFORTS)}")
     for name, adapter in adapters.items():
         if not isinstance(adapter, dict) or not isinstance(adapter.get("command"), list):
             raise PirloError(f"adapter '{name}' needs a command list")
@@ -339,57 +344,39 @@ def pick(models, cli, size, efforts, fallback_sizes):
     return None
 
 
+def suggest(entry):
+    """The cheapest sensible model of one CLI: a small model at medium effort."""
+    cli, models = entry["cli"], entry["models"]
+    if cli == "claude":
+        return {"cli": cli, "model": "haiku", "effort": "medium"}
+    if not models:
+        return None
+    if cli == "codex":
+        return {"cli": cli, "model": pick(models, cli, 0, [], (1,)), "effort": "medium"}
+    return {"cli": cli, "model": pick(models, cli, 0, ("medium", "low", "high", None), (1,))}
+
+
 def propose(clis, leader):
+    """Prefer a worker on another subscription than the lead's, so the lead's quota is spared."""
     usable = [c for c in clis if c["installed"] and c["loggedIn"] is not False and not c.get("custom")]
-    order = [c for c in ("agy", "codex", "claude") if c != leader] + [leader]
-    workers = [c for name in order for c in usable if c["cli"] == name]
-    notes = []
-    for c in clis:
-        if c["installed"] and c["loggedIn"] is False:
-            notes.append(f"{c['cli']} is installed but not logged in: log in first")
-    tiers = {}
-    worker = workers[0] if workers else None
-    if worker and worker["cli"] != leader and worker["models"]:
-        models = worker["models"]
-        cli = worker["cli"]
-        if cli == "codex":
-            small = pick(models, cli, 0, [], (1,))
-            mid = pick(models, cli, 1, [], (0,)) or small
-            tiers = {
-                "cheap": {"cli": cli, "model": small, "effort": "low"},
-                "standard": {"cli": cli, "model": small, "effort": "high"},
-                "strong": {"cli": cli, "model": mid, "effort": "medium"},
-            }
-        elif cli == "claude":
-            tiers = {
-                "cheap": {"cli": cli, "model": "haiku", "effort": "low"},
-                "standard": {"cli": cli, "model": "haiku", "effort": "high"},
-                "strong": {"cli": cli, "model": "sonnet", "effort": "medium"},
-            }
-        else:
-            tiers = {
-                "cheap": {"cli": cli, "model": pick(models, cli, 0, ("low", "medium", None), (1,))},
-                "standard": {"cli": cli, "model": pick(models, cli, 0, ("high", "medium", None), (1,))},
-                "strong": {"cli": cli, "model": pick(models, cli, 1, ("medium", "high", "low", None), (0,))},
-            }
-    elif leader == "claude":
-        tiers = {t: {"cli": "native"} for t in TIERS}
+    notes = [f"{c['cli']} is installed but not logged in: log in first"
+             for c in clis if c["installed"] and c["loggedIn"] is False]
+    others = [c for name in BUILTIN_CLIS if name != leader for c in usable if c["cli"] == name]
+    # Claude Code leads get the native subagent instead of claude -p, which is far cheaper.
+    same = [c for c in usable if c["cli"] == leader and leader != "claude"]
+    worker = None
+    for entry in others + same:
+        worker = suggest(entry)
+        if worker:
+            break
+    if worker is None and leader == "claude":
+        worker = {"cli": "native"}
         notes.append("no other logged-in CLI: the Claude Code subagent (haiku) does the work itself")
-    elif worker:
-        cli = worker["cli"]
-        small = pick(worker["models"], cli, 0, [], (1,)) if worker["models"] else None
-        mid = pick(worker["models"], cli, 1, [], (0,)) if worker["models"] else None
-        tiers = {
-            "cheap": {"cli": cli, "model": small, "effort": "low"},
-            "standard": {"cli": cli, "model": small, "effort": "high"},
-            "strong": {"cli": cli, "model": mid or small, "effort": "medium"},
-        }
-    else:
+    elif worker is None:
         notes.append("no usable worker CLI found")
-    for spec in tiers.values():
-        for key in [k for k, v in spec.items() if v is None]:
-            del spec[key]
-    return {"version": 1, "leader": leader, "tiers": tiers}, notes
+    elif worker["cli"] == leader:
+        notes.append(f"the worker uses the lead's own subscription ({leader}), with a cheaper model")
+    return {"version": 2, "leader": leader, "worker": worker}, notes
 
 
 # ---------------------------------------------------------------- worker prompt
@@ -683,12 +670,11 @@ def append_log(config, entry):
         pass
 
 
-def base_entry(kind, tier, spec, root, restricted, mode):
+def base_entry(kind, spec, root, restricted, mode):
     return {
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "kind": kind,
         "repo": str(root),
-        "tier": tier,
         "cli": spec.get("cli"),
         "model": spec.get("model"),
         "effort": spec.get("effort"),
@@ -697,9 +683,9 @@ def base_entry(kind, tier, spec, root, restricted, mode):
     }
 
 
-def footer(spec, tier, seconds, extra=""):
+def footer(spec, seconds):
     who = " ".join(x for x in (spec.get("cli"), spec.get("model"), spec.get("effort")) if x)
-    return f"[pirlo: {who}, tier {tier}, {seconds:.1f}s{extra}]"
+    return f"[pirlo: {who}, {seconds:.1f}s]"
 
 
 def prepare(args):
@@ -734,9 +720,9 @@ def cmd_ask(args, mode="read"):
         mode = "read"
         notice = (f"PIRLO_RESTRICTED: {', '.join(restricted)} is active, so workers stay "
                   "read-only. Describe the change; do not make it.\n")
-    spec = tier_spec(config, args.tier)
+    spec = worker_spec(config)
     if spec["cli"] == "native":
-        print(notice + "PIRLO_NATIVE: no external worker for this tier. Do the task yourself with "
+        print(notice + "PIRLO_NATIVE: no external worker is configured. Do the task yourself with "
               "Read, Grep, Glob and read-only Bash, and reply under the same rules: short, "
               "path:line references, no dumps." + (" Never solve exercises or give fixes: "
               "the user is a student." if restricted else ""))
@@ -746,7 +732,7 @@ def cmd_ask(args, mode="read"):
     before = snapshot(root)
     result = run_worker(config, spec, mode, cwd, prompt)
     touched = changed_files(before, snapshot(root))
-    entry = base_entry("edit" if mode == "edit" else "ask", args.tier, spec, root, restricted, mode)
+    entry = base_entry("edit" if mode == "edit" else "ask", spec, root, restricted, mode)
     entry.update({"durationMs": int(result["seconds"] * 1000), "promptChars": len(prompt),
                   "taskChars": len(task), "replyChars": len(result["text"]), "ok": result["ok"],
                   "usage": result["usage"], "filesChanged": len(touched)})
@@ -761,7 +747,7 @@ def cmd_ask(args, mode="read"):
         label = "Files changed" if mode == "edit" else \
             "WARNING: the worker changed files although it was read-only"
         reply += f"\n{label}: {', '.join(touched[:20])} (review with git diff)"
-    reply = notice + reply + "\n" + footer(spec, args.tier, result["seconds"])
+    reply = notice + reply + "\n" + footer(spec, result["seconds"])
     entry["returnedChars"] = len(reply)
     append_log(config, entry)
     print(reply)
@@ -781,33 +767,16 @@ def prune_runs(folder, keep=30):
             pass
 
 
-def cmd_exec(args):
+def cmd_digest(args):
+    """Digest command output piped in. The lead runs the command itself, so its own
+    permission rules and sandbox decide whether the command may run, not pirlo."""
     cwd, root, config, restricted = prepare(args)
-    command = list(args.command or [])
-    if command and command[0] == "--":
-        command = command[1:]
-    if not command:
-        raise PirloError("give the command after --, for example: pirlo exec -- npm test")
-    shell = len(command) == 1
+    if sys.stdin.isatty():
+        raise PirloError("pipe the output in, for example: npm test 2>&1 | pirlo digest")
     started = time.monotonic()
-    try:
-        proc = subprocess.run(
-            command[0] if shell else command, shell=shell, cwd=cwd, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", timeout=int(config["commandTimeoutSeconds"]),
-        )
-        output, code = proc.stdout or "", proc.returncode
-    except subprocess.TimeoutExpired as error:
-        raw = error.stdout or ""
-        output = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-        output += f"\n[pirlo: command killed after {config['commandTimeoutSeconds']}s]"
-        code = "timeout"
-    except OSError as error:
-        raise PirloError(f"could not run the command: {error}")
-    ran = time.monotonic() - started
+    output = sys.stdin.read()
     output = ANSI.sub("", output).replace("\r\n", "\n")
-    shown = " ".join(command)
-    short = shown.splitlines()[0][:120] + (" ..." if len(shown) > 120 or "\n" in shown else "")
+    label = (args.label or "").strip()
     folder = ensure_local_dir(root) / "runs"
     folder.mkdir(exist_ok=True)
     log_file = folder / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}.log"
@@ -815,13 +784,13 @@ def cmd_exec(args):
     prune_runs(folder)
     log_ref = os.path.relpath(log_file, cwd)
     lines = output.count("\n") + (1 if output and not output.endswith("\n") else 0)
-    head = f"$ {short}\nexit {code}, {lines} lines, {ran:.1f}s, full output: {log_ref}"
+    head = (f"$ {label}\n" if label else "") + f"{lines} lines of output, saved in {log_ref}"
     try:
-        spec = tier_spec(config, args.tier)
+        spec = worker_spec(config)
     except PirloError:
         spec = {"cli": "none"}
-    entry = base_entry("exec", args.tier, spec, root, restricted, "read")
-    entry.update({"exitCode": code, "outputChars": len(output), "commandSeconds": round(ran, 1)})
+    entry = base_entry("digest", spec, root, restricted, "read")
+    entry.update({"outputChars": len(output), "taskChars": len(read_task(args, stdin=False))})
 
     if len(output) <= int(config["inlineOutputChars"]):
         reply = f"{head}\n{output.strip()}"
@@ -842,24 +811,25 @@ def cmd_exec(args):
         print(reply)
         return 0
 
-    focus = read_task(args, stdin=False) or ("Did it pass? For each failure or error: path:line, the message "
-                                "in one line, and the likely cause when it is evident. Group "
-                                "repeated errors. Skip passing items and noise.")
+    focus = read_task(args, stdin=False) or (
+        "Did it pass? For each failure or error: path:line, the message in one line, and the "
+        "likely cause when it is evident. Group repeated errors. Skip passing items and noise.")
     if len(output) <= int(config["embedOutputChars"]):
         material = f"Its output ({lines} lines):\n<output>\n{output}\n</output>"
     else:
         material = (f"Its output has {lines} lines, saved in the file {log_file}. Read the parts "
                     "you need; start with the end and the lines that mention errors.")
+    what = f"The command `{label}`" if label else "A command"
     prompt = (contract("read", config["maxReplyWords"], restricted) +
-              f"\n\nThe command `{shown}` ran in {cwd} and exited with {code}. {material}\n\n"
+              f"\n\n{what} ran in {cwd}. {material}\n\n"
               f"Task: {focus}\nWhen you cite the output, cite it as {log_ref}:<line>.\n")
     result = run_worker(config, spec, "read", cwd, prompt)
-    entry.update({"durationMs": int(result["seconds"] * 1000), "promptChars": len(prompt),
+    entry.update({"durationMs": int((time.monotonic() - started) * 1000), "promptChars": len(prompt),
                   "replyChars": len(result["text"]), "ok": result["ok"],
                   "usage": result["usage"]})
     if result["ok"]:
         reply = f"{head}\n{limit_reply(result['text'], int(config['maxReplyChars']))}\n" + \
-            footer(spec, args.tier, result["seconds"])
+            footer(spec, result["seconds"])
     else:
         entry["error"] = (result["error"] or "")[:300]
         reply = f"{head}\n[pirlo: worker failed ({(result['error'] or '')[:200]}); free excerpt below]\n{digest}"
@@ -901,7 +871,7 @@ def cmd_save(args):
     data = data.get("config", data) if isinstance(data, dict) else data
     validate_config(data)
     data["scope"] = args.scope
-    data.setdefault("version", 1)
+    data.setdefault("version", 2)
     if args.scope == "user":
         path = user_config_path()
         write_json(path, data)
@@ -964,7 +934,7 @@ def summarize(entries):
         s["leadCost"] += returned + estimate_tokens(e.get("taskChars", 0))
         s["workerSeconds"] += e.get("durationMs", 0) / 1000
         if e.get("cli") in (None, "none"):
-            if kind == "exec":
+            if kind == "digest":
                 s["skipped"] += 1
             continue
         key = " ".join(x for x in (e.get("cli"), e.get("model"), e.get("effort")) if x)
@@ -975,7 +945,7 @@ def summarize(entries):
             w["input"] += usage.get("inputTokens", 0)
             w["output"] += usage.get("outputTokens", 0)
             w["reportedRuns"] += 1
-        if kind == "exec":
+        if kind == "digest":
             s["execRuns"] += 1
             s["execOutput"] += estimate_tokens(e.get("outputChars", 0))
             s["execReturned"] += returned
@@ -1063,6 +1033,33 @@ def cmd_hook(args):
     return 0
 
 
+def cmd_allow(args):
+    """Let Claude Code run pirlo's read-only commands without a permission prompt."""
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    path = base / "settings.json"
+    data = read_json(path) if path.exists() else {}
+    rules = ", ".join(ALLOW_RULES)
+    if not isinstance(data, dict):
+        raise PirloError(f"{path} is not plain JSON; add to permissions.allow by hand: {rules}")
+    permissions = data.setdefault("permissions", {})
+    allow = permissions.setdefault("allow", []) if isinstance(permissions, dict) else None
+    if not isinstance(allow, list):
+        raise PirloError(f"permissions.allow in {path} is not a list; add by hand: {rules}")
+    added = [rule for rule in ALLOW_RULES if rule not in allow]
+    if added:
+        allow.extend(added)
+        write_json(path, data)
+        print(f"added to {path}: {', '.join(added)}")
+    else:
+        print(f"{path} already allows pirlo's read-only commands")
+    return 0
+
+
+def cmd_instructions(args):
+    print(LEADER_INSTRUCTIONS, end="")
+    return 0
+
+
 def cmd_log(args):
     print(log_path())
     return 0
@@ -1075,7 +1072,6 @@ def main(argv=None):
 
     def worker_parser(name, help_text):
         p = sub.add_parser(name, help=help_text)
-        p.add_argument("--tier", choices=TIERS, default="cheap")
         p.add_argument("--cwd")
         return p
 
@@ -1085,15 +1081,15 @@ def main(argv=None):
     p = worker_parser("edit", "a worker makes a mechanical edit")
     p.add_argument("task", nargs="*")
     p.set_defaults(func=cmd_edit)
-    p = worker_parser("exec", "run a command; a worker digests long output")
+    p = worker_parser("digest", "a worker digests long command output piped in")
     p.add_argument("--task", dest="task", action="append", help="what to look for in the output")
-    p.add_argument("command", nargs=argparse.REMAINDER)
-    p.set_defaults(func=cmd_exec)
+    p.add_argument("--label", help="the command that produced the output, for the reply")
+    p.set_defaults(func=cmd_digest)
     p = sub.add_parser("detect", help="find installed and logged-in CLIs and their models")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_detect)
-    p = sub.add_parser("propose", help="propose a tier mapping from what is installed")
-    p.add_argument("--leader", choices=BUILTIN_CLIS, default="claude")
+    p = sub.add_parser("propose", help="propose a worker from what is installed")
+    p.add_argument("--leader", default="claude", help="the CLI you lead from: claude, codex, agy, kimi...")
     p.set_defaults(func=cmd_propose)
     p = sub.add_parser("save", help="save a config read from stdin")
     p.add_argument("--scope", choices=("user", "local"), required=True)
@@ -1108,6 +1104,10 @@ def main(argv=None):
     p = sub.add_parser("hook", help="SessionStart hook for Claude Code")
     p.add_argument("--claude-code", action="store_true", help="the lead is Claude Code")
     p.set_defaults(func=cmd_hook)
+    p = sub.add_parser("allow", help="let Claude Code run pirlo's read-only commands unprompted")
+    p.set_defaults(func=cmd_allow)
+    p = sub.add_parser("instructions", help="print the lead instructions for AGENTS.md")
+    p.set_defaults(func=cmd_instructions)
     p = sub.add_parser("log", help="print the path of the usage log")
     p.set_defaults(func=cmd_log)
 

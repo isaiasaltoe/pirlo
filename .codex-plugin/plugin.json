@@ -1,6 +1,6 @@
 {
   "name": "pirlo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Delegates bulky reading, test runs and searches to cheaper worker CLIs, so the lead agent saves its quota.",
   "author": {
     "name": "isaiasaltoe",
@@ -9,11 +9,11 @@
   "homepage": "https://github.com/isaiasaltoe/pirlo",
   "repository": "https://github.com/isaiasaltoe/pirlo",
   "license": "MIT",
-  "skills": "./codex/skills/",
+  "skills": "./portable/skills/",
   "interface": {
     "displayName": "pirlo",
     "shortDescription": "Hand bulky reading and test runs to cheaper worker CLIs.",
-    "longDescription": "The lead agent delegates test runs, long logs, docs and wide searches to a cheaper official CLI (Antigravity, Codex or Claude Code) in read-only mode, gets a short answer with path:line references, and logs each delegation locally to estimate the savings.",
+    "longDescription": "The lead agent delegates test runs, long logs, docs and wide searches to a cheaper official CLI (Antigravity, Codex, Claude Code or any CLI) in read-only mode, gets a short answer with path:line references, and logs each delegation locally to estimate the savings.",
     "developerName": "isaiasaltoe",
     "category": "Productivity",
     "capabilities": ["Read"],

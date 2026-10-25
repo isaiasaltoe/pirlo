@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "pirlo",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "Delegates bulky reading, test runs and searches to cheaper worker CLIs.",
       "source": {
         "source": "local",

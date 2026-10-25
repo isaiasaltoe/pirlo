@@ -13,11 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PIRLO = ROOT / "bin" / "pirlo"
 STUBS = ROOT / "tests" / "stubs"
 
-AUTHOR_TIERS = {
-    "cheap": {"cli": "agy", "model": "gemini-3.8-flash-low"},
-    "standard": {"cli": "agy", "model": "gemini-3.8-flash-high"},
-    "strong": {"cli": "agy", "model": "gemini-4-argon-medium"},
-}
+AUTHOR_WORKER = {"cli": "agy", "model": "gemini-3.8-flash-medium"}
 
 
 def link(folder, cli):
@@ -60,8 +56,8 @@ class PirloCase(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         )
 
-    def save(self, tiers, scope="user", **extra):
-        data = dict({"version": 1, "tiers": tiers}, **extra)
+    def save(self, worker, scope="user", **extra):
+        data = dict({"version": 2, "worker": worker}, **extra)
         result = self.pirlo("save", "--scope", scope, stdin=json.dumps(data))
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -92,7 +88,15 @@ class DetectAndPropose(PirloCase):
 
     def test_propose_for_claude_lead_with_antigravity(self):
         out = json.loads(self.pirlo("propose", "--leader", "claude").stdout)
-        self.assertEqual(out["config"]["tiers"], AUTHOR_TIERS)
+        self.assertEqual(out["config"]["worker"], AUTHOR_WORKER)
+
+    def test_propose_prefers_another_subscription_than_the_lead(self):
+        out = json.loads(self.pirlo("propose", "--leader", "agy").stdout)
+        self.assertEqual(out["config"]["worker"]["cli"], "codex")
+
+    def test_propose_for_any_lead(self):
+        out = json.loads(self.pirlo("propose", "--leader", "kimi").stdout)
+        self.assertEqual(out["config"]["worker"], AUTHOR_WORKER)
 
     def test_propose_codex_only(self):
         only = Path(self.tmp.name) / "only"
@@ -100,9 +104,8 @@ class DetectAndPropose(PirloCase):
         link(only, "codex")
         out = json.loads(self.pirlo("propose", "--leader", "codex",
                                     PATH=f"{only}{os.pathsep}/usr/bin:/bin").stdout)
-        tiers = out["config"]["tiers"]
-        self.assertEqual(tiers["cheap"], {"cli": "codex", "model": "gpt-6-luna", "effort": "low"})
-        self.assertEqual(tiers["strong"]["model"], "gpt-5.6-terra")
+        self.assertEqual(out["config"]["worker"], {"cli": "codex", "model": "gpt-6-luna", "effort": "medium"})
+        self.assertIn("lead's own subscription", " ".join(out["notes"]))
 
     def test_propose_claude_only_uses_native_subagent(self):
         only = Path(self.tmp.name) / "only"
@@ -110,32 +113,32 @@ class DetectAndPropose(PirloCase):
         link(only, "claude")
         out = json.loads(self.pirlo("propose", "--leader", "claude",
                                     PATH=f"{only}{os.pathsep}/usr/bin:/bin").stdout)
-        self.assertEqual(out["config"]["tiers"]["cheap"], {"cli": "native"})
+        self.assertEqual(out["config"]["worker"], {"cli": "native"})
 
 
 class Ask(PirloCase):
     def test_agy_read_only_call(self):
-        self.save(AUTHOR_TIERS)
-        out = self.pirlo("ask", "--tier", "strong", "where is the greeting?", STUB_REPLY="app.rb:1 prints hi")
+        self.save(AUTHOR_WORKER)
+        out = self.pirlo("ask", "where is the greeting?", STUB_REPLY="app.rb:1 prints hi")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("app.rb:1 prints hi", out.stdout)
-        self.assertIn("[pirlo: agy gemini-4-argon-medium, tier strong", out.stdout)
+        self.assertIn("[pirlo: agy gemini-3.8-flash-medium, ", out.stdout)
         argv = self.calls()[0]["argv"]
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
-        self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-argon-medium")
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-medium")
         prompt = argv[-1]
         self.assertTrue(prompt.startswith("--print="))
         self.assertIn("READ-ONLY", prompt)
         self.assertIn("path:line", prompt)
         self.assertIn("where is the greeting?", prompt)
         entry = self.log()[0]
-        self.assertEqual((entry["kind"], entry["cli"], entry["tier"], entry["ok"]), ("ask", "agy", "strong", True))
+        self.assertEqual((entry["kind"], entry["cli"], entry["ok"]), ("ask", "agy", True))
         self.assertEqual(entry["usage"], {"inputTokens": 5200, "cachedTokens": 0, "outputTokens": 140})
         for key in ("ts", "repo", "model", "durationMs", "promptChars", "replyChars"):
             self.assertIn(key, entry)
 
     def test_codex_read_only_sandbox_and_usage(self):
-        self.save({"cheap": {"cli": "codex", "model": "gpt-6-luna", "effort": "low"}})
+        self.save({"cli": "codex", "model": "gpt-6-luna", "effort": "low"})
         out = self.pirlo("ask", "find the config loader")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("stub reply from codex", out.stdout)
@@ -149,7 +152,7 @@ class Ask(PirloCase):
         self.assertEqual(self.log()[0]["usage"], {"inputTokens": 9000, "cachedTokens": 6000, "outputTokens": 210})
 
     def test_claude_worker_usage_counts_cache(self):
-        self.save({"cheap": {"cli": "claude", "model": "haiku"}})
+        self.save({"cli": "claude", "model": "haiku"})
         out = self.pirlo("ask", "summarize README")
         self.assertEqual(out.returncode, 0, out.stderr)
         argv = self.calls()[0]["argv"]
@@ -161,7 +164,7 @@ class Ask(PirloCase):
         script = Path(self.tmp.name) / "mycli"
         script.write_text("#!/bin/sh\necho \"answer for: $2\"\n")
         script.chmod(0o755)
-        self.save({"cheap": {"cli": "mycli", "model": "m1"}},
+        self.save({"cli": "mycli", "model": "m1"},
                   adapters={"mycli": {"command": [str(script), "{model}", "{prompt}"], "format": "text"}})
         out = self.pirlo("ask", "count the files")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -169,18 +172,18 @@ class Ask(PirloCase):
         self.assertIn("count the files", out.stdout)
 
     def test_custom_adapter_cannot_edit_without_edit_command(self):
-        self.save({"cheap": {"cli": "mycli"}}, adapters={"mycli": {"command": ["true"]}})
+        self.save({"cli": "mycli"}, adapters={"mycli": {"command": ["true"]}})
         out = self.pirlo("edit", "rename")
         self.assertEqual(out.returncode, 2)
         self.assertIn("cannot edit", out.stderr)
 
     def test_task_on_stdin(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         self.pirlo("ask", stdin='what does "hi" mean?')
         self.assertIn('what does "hi" mean?', self.calls()[0]["argv"][-1])
 
-    def test_native_tier_hands_back(self):
-        self.save({"cheap": {"cli": "native"}})
+    def test_native_worker_hands_back(self):
+        self.save({"cli": "native"})
         out = self.pirlo("ask", "anything")
         self.assertIn("PIRLO_NATIVE", out.stdout)
         self.assertEqual(self.calls(), [])
@@ -195,7 +198,7 @@ class Ask(PirloCase):
         self.assertIn("setup", out.stderr)
 
     def test_worker_failure_is_reported_and_logged(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         out = self.pirlo("ask", "x", STUB_FAIL="1")
         self.assertEqual(out.returncode, 1)
         self.assertIn("PIRLO_FAILED", out.stdout)
@@ -203,19 +206,19 @@ class Ask(PirloCase):
         self.assertFalse(self.log()[0]["ok"])
 
     def test_long_reply_is_cut(self):
-        self.save(AUTHOR_TIERS, maxReplyChars=100)
+        self.save(AUTHOR_WORKER, maxReplyChars=100)
         out = self.pirlo("ask", "x", STUB_REPLY="word " * 200)
         self.assertIn("reply cut at 100 characters", out.stdout)
         self.assertLess(len(out.stdout), 400)
 
     def test_read_only_tripwire(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         out = self.pirlo("ask", "x", STUB_WRITE=str(self.repo / "intruder.txt"))
         self.assertIn("WARNING: the worker changed files although it was read-only: intruder.txt", out.stdout)
         self.assertEqual(self.log()[0]["filesChanged"], 1)
 
     def test_edit_mode_and_changed_files(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         out = self.pirlo("edit", "rename foo to bar", STUB_WRITE=str(self.repo / "app.rb"))
         argv = self.calls()[0]["argv"]
         self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits")
@@ -223,7 +226,7 @@ class Ask(PirloCase):
         self.assertEqual(self.log()[0]["kind"], "edit")
 
     def test_no_recursion_inside_a_worker(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         out = self.pirlo("ask", "x", PIRLO_WORKER="1")
         self.assertEqual(out.returncode, 2)
         self.assertEqual(self.calls(), [])
@@ -237,7 +240,7 @@ class Fessor(PirloCase):
 
     def test_fessor_forces_read_only_and_no_solutions(self):
         self.enable_fessor()
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         out = self.pirlo("edit", "fix the exercise")
         self.assertIn("PIRLO_RESTRICTED", out.stdout)
         argv = self.calls()[0]["argv"]
@@ -247,7 +250,7 @@ class Fessor(PirloCase):
 
     def test_fessor_via_agents_md(self):
         (self.repo / "AGENTS.md").write_text("# project\n\n# fessor\n\nVocê é o fessor\n")
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         self.pirlo("ask", "explain")
         self.assertIn("Never solve exercises", self.calls()[0]["argv"][-1])
 
@@ -255,78 +258,79 @@ class Fessor(PirloCase):
         (self.repo / ".claude").mkdir()
         (self.repo / ".claude" / "settings.local.json").write_text(
             json.dumps({"enabledPlugins": {"fessor@fessor": False}}))
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         self.pirlo("ask", "explain")
         self.assertNotIn("Never solve exercises", self.calls()[0]["argv"][-1])
 
     def test_native_mentions_restriction(self):
         self.enable_fessor()
-        self.save({"cheap": {"cli": "native"}})
+        self.save({"cli": "native"})
         self.assertIn("student", self.pirlo("ask", "x").stdout)
 
 
-class Exec(PirloCase):
+BIG_OUTPUT = "".join(f"ok line {i}\n" for i in range(400)) + "app/models/user.rb:42: Error: undefined method\n"
+
+
+class Digest(PirloCase):
     def test_short_output_skips_the_worker(self):
-        self.save(AUTHOR_TIERS)
-        out = self.pirlo("exec", "--", sys.executable, "-c", "print('3 tests, 0 failures')")
+        self.save(AUTHOR_WORKER)
+        out = self.pirlo("digest", "--label", "rails test", stdin="3 tests, 0 failures\n")
         self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("$ rails test", out.stdout)
         self.assertIn("3 tests, 0 failures", out.stdout)
-        self.assertIn("exit 0", out.stdout)
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.log()[0]["cli"], "none")
 
-    def big_command(self, lines=400):
-        script = (f"import sys\nfor i in range({lines}): print('ok line', i)\n"
-                  "print('app/models/user.rb:42: Error: undefined method')\nsys.exit(1)")
-        return [sys.executable, "-c", script]
-
     def test_long_output_goes_to_the_worker_with_a_saved_log(self):
-        self.save(AUTHOR_TIERS)
-        out = self.pirlo("exec", "--tier", "cheap", "--task", "list failures", "--", *self.big_command(),
+        self.save(AUTHOR_WORKER)
+        out = self.pirlo("digest", "--label", "rails test", "--task", "list failures", stdin=BIG_OUTPUT,
                          STUB_REPLY="1 failure: app/models/user.rb:42 undefined method")
-        self.assertIn("exit 1", out.stdout)
+        self.assertIn("401 lines of output", out.stdout)
         self.assertIn("1 failure", out.stdout)
         logs = list((self.repo / ".pirlo" / "runs").glob("*.log"))
         self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].read_text(), BIG_OUTPUT)
         self.assertEqual((self.repo / ".pirlo" / ".gitignore").read_text(), "*\n")
         prompt = self.calls()[0]["argv"][-1]
-        self.assertIn("exited with 1", prompt)
+        self.assertIn("The command `rails test`", prompt)
         self.assertIn("list failures", prompt)
         self.assertIn("app/models/user.rb:42: Error", prompt)
         entry = self.log()[0]
-        self.assertEqual(entry["kind"], "exec")
-        self.assertGreater(entry["outputChars"], 4000)
-        self.assertEqual(entry["exitCode"], 1)
+        self.assertEqual(entry["kind"], "digest")
+        self.assertEqual(entry["outputChars"], len(BIG_OUTPUT))
 
     def test_huge_output_is_passed_as_a_file(self):
-        self.save(AUTHOR_TIERS, embedOutputChars=1000)
-        self.pirlo("exec", "--", *self.big_command())
+        self.save(AUTHOR_WORKER, embedOutputChars=1000)
+        self.pirlo("digest", stdin=BIG_OUTPUT)
         prompt = self.calls()[0]["argv"][-1]
         self.assertIn("saved in the file", prompt)
         self.assertNotIn("<output>", prompt)
 
     def test_worker_failure_falls_back_to_free_excerpt(self):
-        self.save(AUTHOR_TIERS)
-        out = self.pirlo("exec", "--", *self.big_command(), STUB_FAIL="1")
+        self.save(AUTHOR_WORKER)
+        out = self.pirlo("digest", stdin=BIG_OUTPUT, STUB_FAIL="1")
         self.assertIn("worker failed", out.stdout)
         self.assertRegex(out.stdout, r"\.pirlo/runs/[^:]+\.log:401: app/models/user.rb:42: Error")
 
-    def test_native_exec_returns_excerpt(self):
-        self.save({"cheap": {"cli": "native"}})
-        out = self.pirlo("exec", "--", *self.big_command())
+    def test_native_returns_excerpt(self):
+        self.save({"cli": "native"})
+        out = self.pirlo("digest", stdin=BIG_OUTPUT)
         self.assertIn("PIRLO_NATIVE", out.stdout)
         self.assertIn("Last 30 lines", out.stdout)
         self.assertLess(len(out.stdout), 4000)
 
-    def test_shell_string_command(self):
-        self.save(AUTHOR_TIERS)
-        out = self.pirlo("exec", "--", "echo one && echo two")
-        self.assertIn("one\ntwo", out.stdout)
+    def test_real_pipe_with_ansi_colors(self):
+        self.save(AUTHOR_WORKER)
+        out = subprocess.run(
+            f"printf '\\033[31mFAIL\\033[0m x\\n' 2>&1 | {sys.executable} {PIRLO} digest",
+            shell=True, cwd=self.repo, env=dict(self.env), capture_output=True, text=True)
+        self.assertIn("FAIL x", out.stdout)
+        self.assertNotIn("\x1b", out.stdout)
 
 
 class ScopeAndSavings(PirloCase):
     def test_local_scope_keeps_other_repos_inactive(self):
-        self.save(AUTHOR_TIERS, scope="local")
+        self.save(AUTHOR_WORKER, scope="local")
         self.assertTrue((self.repo / ".pirlo" / "config.json").exists())
         self.assertEqual((self.repo / ".pirlo" / ".gitignore").read_text(), "*\n")
         other = Path(self.tmp.name) / "other"
@@ -337,29 +341,30 @@ class ScopeAndSavings(PirloCase):
         self.assertEqual(self.pirlo("ask", "x").returncode, 0)
 
     def test_local_overrides_user(self):
-        self.save(AUTHOR_TIERS)
-        self.save({"cheap": {"cli": "codex", "model": "gpt-6-luna"}}, scope="local")
+        self.save(AUTHOR_WORKER)
+        self.save({"cli": "codex", "model": "gpt-6-luna"}, scope="local")
         self.pirlo("ask", "x")
         self.assertEqual(self.calls()[0]["cli"], "codex")
         shown = json.loads(self.pirlo("show").stdout)
         self.assertEqual(shown["source"], "local")
-        self.assertEqual(shown["config"]["tiers"]["strong"]["cli"], "agy")
+        self.assertEqual(shown["config"]["worker"]["cli"], "codex")
+        self.assertEqual(shown["config"]["scope"], "local")
 
     def test_save_rejects_bad_config(self):
-        bad = self.pirlo("save", "--scope", "user", stdin=json.dumps({"tiers": {"cheap": {"cli": "nope"}}}))
+        bad = self.pirlo("save", "--scope", "user", stdin=json.dumps({"worker": {"cli": "nope"}}))
         self.assertEqual(bad.returncode, 2)
-        self.assertIn("unknown cli", bad.stderr)
+        self.assertIn("unknown worker cli", bad.stderr)
 
     def test_savings_report_is_an_explicit_estimate(self):
-        self.save(AUTHOR_TIERS)
-        self.pirlo("exec", "--", *Exec.big_command(self))
+        self.save(AUTHOR_WORKER)
+        self.pirlo("digest", stdin=BIG_OUTPUT)
         self.pirlo("ask", "x")
-        self.pirlo("exec", "--", "echo short")
+        self.pirlo("digest", stdin="short\n")
         out = self.pirlo("savings")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("ESTIMATE", out.stdout)
         self.assertIn("estimate, not a measurement", out.stdout)
-        self.assertIn("agy gemini-3.8-flash-low: 2 runs", out.stdout)
+        self.assertIn("agy gemini-3.8-flash-medium: 2 runs", out.stdout)
         data = json.loads(self.pirlo("savings", "--json").stdout)
         self.assertEqual(data["runs"], 3)
         self.assertEqual(data["skipped"], 1)
@@ -370,6 +375,45 @@ class ScopeAndSavings(PirloCase):
         self.assertIn("No delegations", self.pirlo("savings").stdout)
 
 
+class LeaderSupport(PirloCase):
+    def test_allow_adds_read_only_rules_once(self):
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"model": "sonnet", "permissions": {"allow": ["Bash(git log *)"]}}))
+        self.assertEqual(self.pirlo("allow").returncode, 0)
+        self.pirlo("allow")
+        data = json.loads(settings.read_text())
+        allow = data["permissions"]["allow"]
+        self.assertEqual(data["model"], "sonnet")
+        self.assertEqual(allow.count("Bash(pirlo ask *)"), 1)
+        self.assertIn("Bash(pirlo digest*)", allow)
+        self.assertIn("Bash(git log *)", allow)
+        self.assertFalse(any("edit" in rule for rule in allow))
+
+    def test_allow_refuses_a_file_it_cannot_parse(self):
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text("// comment\n{}")
+        out = self.pirlo("allow")
+        self.assertEqual(out.returncode, 2)
+        self.assertEqual(settings.read_text(), "// comment\n{}")
+
+    def test_instructions_cover_the_three_commands(self):
+        text = self.pirlo("instructions").stdout
+        for command in ("| pirlo digest", "pirlo ask", "pirlo edit"):
+            self.assertIn(command, text)
+
+    def test_install_script_puts_pirlo_on_a_bin_dir(self):
+        bin_dir = Path(self.tmp.name) / "bin"
+        skills = Path(self.tmp.name) / "skills"
+        out = subprocess.run(["sh", str(ROOT / "install.sh")], capture_output=True, text=True,
+                             env=dict(self.env, PIRLO_BIN_DIR=str(bin_dir), PIRLO_SKILLS_DIR=str(skills)))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(os.access(bin_dir / "pirlo", os.X_OK))
+        self.assertTrue((skills / "pirlo" / "SKILL.md").is_file())
+        self.assertIn("add", out.stdout)
+
+
 class Hook(PirloCase):
     def context(self, **env):
         out = self.pirlo("hook", **env)
@@ -377,7 +421,7 @@ class Hook(PirloCase):
         return json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else None
 
     def test_reminds_the_lead_once_when_configured(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         self.assertIn("pirlo:worker", self.context())
 
     def test_silent_without_setup_outside_claude_code(self):
@@ -389,7 +433,7 @@ class Hook(PirloCase):
         self.assertIn("pirlo:worker", out.stdout)
 
     def test_silent_where_local_scope_does_not_apply(self):
-        self.save(AUTHOR_TIERS, scope="local")
+        self.save(AUTHOR_WORKER, scope="local")
         other = Path(self.tmp.name) / "other"
         other.mkdir()
         out = self.pirlo("hook", cwd=other, CLAUDECODE="1")
@@ -397,11 +441,11 @@ class Hook(PirloCase):
 
     def test_mentions_fessor(self):
         (self.repo / "AGENTS.md").write_text("# fessor\n")
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         self.assertIn("fessor is active", self.context())
 
     def test_silent_inside_a_worker(self):
-        self.save(AUTHOR_TIERS)
+        self.save(AUTHOR_WORKER)
         self.assertIsNone(self.context(PIRLO_WORKER="1"))
 
 
@@ -430,7 +474,7 @@ class PluginFiles(unittest.TestCase):
         self.assertIn("proactively", meta["description"])
 
     def test_skills_have_names_and_descriptions(self):
-        for path in list((ROOT / "skills").glob("*/SKILL.md")) + list((ROOT / "codex" / "skills").glob("*/SKILL.md")):
+        for path in list((ROOT / "skills").glob("*/SKILL.md")) + list((ROOT / "portable" / "skills").glob("*/SKILL.md")):
             meta = self.frontmatter(path)
             self.assertTrue(meta.get("name") and meta.get("description"), path)
 
@@ -440,8 +484,8 @@ class PluginFiles(unittest.TestCase):
         self.assertIn('"${CLAUDE_PLUGIN_ROOT}/bin/pirlo" hook --claude-code', command)
         self.assertNotIn("UserPromptSubmit", hooks["hooks"])
 
-    def test_codex_skills_point_at_the_script(self):
-        skill = ROOT / "codex" / "skills" / "pirlo"
+    def test_portable_skills_point_at_the_script(self):
+        skill = ROOT / "portable" / "skills" / "pirlo"
         self.assertTrue((skill / "../../../bin/pirlo").resolve().is_file())
 
 
