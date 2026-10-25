@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""pirlo: hand bulky, low-judgment work to cheaper agent CLIs.
+
+The lead agent (Claude Code, Codex...) calls this script instead of reading raw
+material itself. pirlo runs the command or asks a worker CLI, returns a short
+reply with path:line references, and appends one JSONL line to a local log.
+
+Standard library only. Every worker is an official CLI logged into its own
+subscription and run non-interactively; pirlo never reads or forwards tokens.
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+VERSION = "0.1.0"
+TIERS = ("cheap", "standard", "strong")
+BUILTIN_CLIS = ("agy", "codex", "claude")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULTS = {
+    "version": 1,
+    "tiers": {},
+    "commandTimeoutSeconds": 900,
+    "workerTimeoutSeconds": 600,
+    "maxReplyWords": 200,
+    "maxReplyChars": 6000,
+    "inlineOutputChars": 2500,
+    "embedOutputChars": 50000,
+    "restrictivePlugins": ["fessor"],
+    "log": True,
+}
+CLAUDE_ALIASES = ["haiku", "sonnet", "opus"]
+# Rough size families by name. Setup always shows the proposal to the user,
+# so a wrong guess costs one correction, not a bad run.
+SMALL_WORDS = ("flash", "mini", "haiku", "luna", "lite", "nano", "small", "spark")
+LARGE_WORDS = ("opus", "ultra", "astra", "sol", "pro", "max")
+HOME_PREFIX = {"agy": "gemini", "codex": "gpt", "claude": ""}
+ERROR_LINE = re.compile(
+    r"error|fail|exception|traceback|warning|undefined|cannot|can't|not found|missing|"
+    r"expected|assert|panic|fatal|denied|overfull|underfull|\?\?|^!",
+    re.IGNORECASE,
+)
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+class PirloError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- paths
+
+
+def pirlo_home():
+    if os.environ.get("PIRLO_HOME"):
+        return Path(os.environ["PIRLO_HOME"]).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base).expanduser() / "pirlo"
+
+
+def user_config_path():
+    return pirlo_home() / "config.json"
+
+
+def log_path():
+    return pirlo_home() / "usage.jsonl"
+
+
+def repo_root(cwd):
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True,
+            text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return Path(cwd).resolve()
+
+
+def local_dir(root):
+    return Path(root) / ".pirlo"
+
+
+def ensure_local_dir(root):
+    folder = local_dir(root)
+    folder.mkdir(parents=True, exist_ok=True)
+    ignore = folder / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+    return folder
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config(root):
+    """Return (config, source, active). Local config wins over user config."""
+    user = read_json(user_config_path())
+    local = read_json(local_dir(root) / "config.json")
+    config = json.loads(json.dumps(DEFAULTS))
+    source = "defaults"
+    for layer, name in ((user, "user"), (local, "local")):
+        if not isinstance(layer, dict):
+            continue
+        for key, value in layer.items():
+            if key == "tiers" and isinstance(value, dict):
+                config["tiers"].update(value)
+            else:
+                config[key] = value
+        source = name
+    # A user config with scope "local" means: only repositories with their own config.
+    active = isinstance(local, dict) or not (isinstance(user, dict) and user.get("scope") == "local")
+    return config, source, active
+
+
+def tier_spec(config, tier):
+    spec = config.get("tiers", {}).get(tier)
+    if isinstance(spec, str):
+        spec = {"cli": spec}
+    if isinstance(spec, dict) and spec.get("cli"):
+        return spec
+    # Nothing configured: inside Claude Code the subagent itself is the worker.
+    if os.environ.get("CLAUDECODE") and not config.get("tiers"):
+        return {"cli": "native"}
+    raise PirloError(
+        f"tier '{tier}' is not configured; run the pirlo setup (/pirlo:setup in Claude Code)"
+    )
+
+
+def validate_config(data):
+    if not isinstance(data, dict):
+        raise PirloError("config must be a JSON object")
+    tiers = data.get("tiers", {})
+    if not isinstance(tiers, dict):
+        raise PirloError("tiers must be an object")
+    adapters = data.get("adapters", {})
+    for name, spec in tiers.items():
+        if name not in TIERS:
+            raise PirloError(f"unknown tier '{name}' (use {', '.join(TIERS)})")
+        if isinstance(spec, str):
+            spec = {"cli": spec}
+        if not isinstance(spec, dict) or not spec.get("cli"):
+            raise PirloError(f"tier '{name}' needs a cli")
+        cli = spec["cli"]
+        if cli not in BUILTIN_CLIS + ("native",) and cli not in adapters:
+            raise PirloError(f"tier '{name}': unknown cli '{cli}' (add it under adapters)")
+        if spec.get("effort") and spec["effort"] not in EFFORTS:
+            raise PirloError(f"tier '{name}': effort must be one of {', '.join(EFFORTS)}")
+    for name, adapter in adapters.items():
+        if not isinstance(adapter, dict) or not isinstance(adapter.get("command"), list):
+            raise PirloError(f"adapter '{name}' needs a command list")
+    return data
+
+
+# ---------------------------------------------------------------- restrictions
+
+
+def restrictions(root, names):
+    """Plugins that ask for a read-only worker that never solves the work for the user."""
+    found = []
+    if os.environ.get("PIRLO_READ_ONLY"):
+        found.append("PIRLO_READ_ONLY")
+    settings = [
+        Path(root) / ".claude" / "settings.local.json",
+        Path(root) / ".claude" / "settings.json",
+        Path.home() / ".claude" / "settings.json",
+    ]
+    for path in settings:
+        data = read_json(path)
+        plugins = data.get("enabledPlugins") if isinstance(data, dict) else None
+        if not isinstance(plugins, dict):
+            continue
+        for key, enabled in plugins.items():
+            name = str(key).split("@")[0]
+            if enabled and name in names and name not in found:
+                found.append(name)
+    for agents in (Path(root) / "AGENTS.md", Path(root) / "GEMINI.md"):
+        try:
+            text = agents.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name in names:
+            if name not in found and re.search(rf"^# {re.escape(name)}\s*$", text, re.MULTILINE):
+                found.append(name)
+    return found
+
+
+# ---------------------------------------------------------------- detection
+
+
+def run_quiet(argv, timeout=20):
+    try:
+        out = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        return out.returncode, (out.stdout or "") + (out.stderr or "")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, str(error)
+
+
+def executable(config, cli):
+    override = (config.get("paths") or {}).get(cli)
+    if override:
+        return override if Path(override).exists() else shutil.which(override)
+    adapter = (config.get("adapters") or {}).get(cli)
+    if adapter:
+        return shutil.which(adapter["command"][0]) or adapter["command"][0]
+    return shutil.which(cli)
+
+
+def classify(model):
+    name = model.lower()
+    effort = next((e for e in EFFORTS if re.search(rf"(^|[-_.]){e}$", name)), None)
+    base = re.sub(rf"[-_.]({'|'.join(EFFORTS)})$", "", name)
+    words = re.split(r"[-_.]", base)
+    if any(w in words for w in SMALL_WORDS):
+        size = 0
+    elif any(w in words for w in LARGE_WORDS):
+        size = 2
+    else:
+        size = 1
+    return size, effort
+
+
+def parse_model_list(text):
+    models = []
+    for line in text.splitlines():
+        line = line.strip().strip("-*• ").strip()
+        if not line:
+            continue
+        token = line.split()[0].strip(",:")
+        if re.fullmatch(r"[a-z0-9][a-z0-9._/-]*[a-z0-9]", token, re.IGNORECASE) and (
+            re.search(r"\d", token) or "-" in token
+        ) and token.lower() not in ("model", "models", "id", "name"):
+            if token not in models:
+                models.append(token)
+    return models
+
+
+def detect_cli(cli, exe):
+    entry = {"cli": cli, "installed": bool(exe), "path": exe, "version": None,
+             "loggedIn": None, "models": [], "efforts": {}}
+    if not exe:
+        return entry
+    code, out = run_quiet([exe, "--version"], timeout=10)
+    if code == 0 and out.strip():
+        entry["version"] = out.strip().splitlines()[0]
+    if cli == "claude":
+        code, out = run_quiet([exe, "auth", "status"])
+        try:
+            entry["loggedIn"] = bool(json.loads(out).get("loggedIn"))
+        except (ValueError, AttributeError):
+            entry["loggedIn"] = None
+        entry["models"] = list(CLAUDE_ALIASES)
+    elif cli == "codex":
+        code, out = run_quiet([exe, "login", "status"])
+        if re.search(r"not logged in", out, re.IGNORECASE):
+            entry["loggedIn"] = False
+        elif code == 0 and re.search(r"logged in", out, re.IGNORECASE):
+            entry["loggedIn"] = True
+        # The local catalog: no model call, no quota.
+        code, out = run_quiet([exe, "debug", "models"], timeout=30)
+        try:
+            catalog = json.loads(out).get("models", [])
+        except (ValueError, AttributeError):
+            catalog = []
+        for model in catalog:
+            if not isinstance(model, dict) or model.get("visibility", "list") != "list":
+                continue
+            slug = model.get("slug")
+            if slug:
+                entry["models"].append(slug)
+                levels = [
+                    level.get("effort") if isinstance(level, dict) else level
+                    for level in model.get("supported_reasoning_levels") or []
+                ]
+                entry["efforts"][slug] = [e for e in levels if e in EFFORTS]
+    elif cli == "agy":
+        # Listing models needs a valid login but runs no prompt, so it spends no quota.
+        code, out = run_quiet([exe, "models"], timeout=30)
+        if code == 0:
+            entry["models"] = parse_model_list(out)
+            entry["loggedIn"] = bool(entry["models"]) or None
+        elif re.search(r"log ?in|auth|unauthori[sz]ed|credential", out, re.IGNORECASE):
+            entry["loggedIn"] = False
+    return entry
+
+
+def detect(config):
+    found = [detect_cli(cli, executable(config, cli)) for cli in BUILTIN_CLIS]
+    for name in (config.get("adapters") or {}):
+        exe = executable(config, name)
+        found.append({"cli": name, "installed": bool(exe and shutil.which(exe)), "path": exe,
+                      "version": None, "loggedIn": None, "models": [], "efforts": {},
+                      "custom": True})
+    return found
+
+
+def pick(models, cli, size, efforts, fallback_sizes):
+    """First model of the wanted size, preferring the CLI's own family and an effort order."""
+    prefix = HOME_PREFIX.get(cli, "")
+    for wanted in [size] + list(fallback_sizes):
+        group = [m for m in models if classify(m)[0] == wanted]
+        home = [m for m in group if m.lower().startswith(prefix)] if prefix else group
+        group = home or group
+        if not group:
+            continue
+        for effort in efforts:
+            for model in group:
+                if classify(model)[1] == effort:
+                    return model
+        return group[0]
+    return None
+
+
+def propose(clis, leader):
+    usable = [c for c in clis if c["installed"] and c["loggedIn"] is not False and not c.get("custom")]
+    order = [c for c in ("agy", "codex", "claude") if c != leader] + [leader]
+    workers = [c for name in order for c in usable if c["cli"] == name]
+    notes = []
+    for c in clis:
+        if c["installed"] and c["loggedIn"] is False:
+            notes.append(f"{c['cli']} is installed but not logged in: log in first")
+    tiers = {}
+    worker = workers[0] if workers else None
+    if worker and worker["cli"] != leader and worker["models"]:
+        models = worker["models"]
+        cli = worker["cli"]
+        if cli == "codex":
+            small = pick(models, cli, 0, [], (1,))
+            mid = pick(models, cli, 1, [], (0,)) or small
+            tiers = {
+                "cheap": {"cli": cli, "model": small, "effort": "low"},
+                "standard": {"cli": cli, "model": small, "effort": "high"},
+                "strong": {"cli": cli, "model": mid, "effort": "medium"},
+            }
+        elif cli == "claude":
+            tiers = {
+                "cheap": {"cli": cli, "model": "haiku", "effort": "low"},
+                "standard": {"cli": cli, "model": "haiku", "effort": "high"},
+                "strong": {"cli": cli, "model": "sonnet", "effort": "medium"},
+            }
+        else:
+            tiers = {
+                "cheap": {"cli": cli, "model": pick(models, cli, 0, ("low", "medium", None), (1,))},
+                "standard": {"cli": cli, "model": pick(models, cli, 0, ("high", "medium", None), (1,))},
+                "strong": {"cli": cli, "model": pick(models, cli, 1, ("medium", "high", "low", None), (0,))},
+            }
+    elif leader == "claude":
+        tiers = {t: {"cli": "native"} for t in TIERS}
+        notes.append("no other logged-in CLI: the Claude Code subagent (haiku) does the work itself")
+    elif worker:
+        cli = worker["cli"]
+        small = pick(worker["models"], cli, 0, [], (1,)) if worker["models"] else None
+        mid = pick(worker["models"], cli, 1, [], (0,)) if worker["models"] else None
+        tiers = {
+            "cheap": {"cli": cli, "model": small, "effort": "low"},
+            "standard": {"cli": cli, "model": small, "effort": "high"},
+            "strong": {"cli": cli, "model": mid or small, "effort": "medium"},
+        }
+    else:
+        notes.append("no usable worker CLI found")
+    for spec in tiers.values():
+        for key in [k for k, v in spec.items() if v is None]:
+            del spec[key]
+    return {"version": 1, "leader": leader, "tiers": tiers}, notes
+
+
+# ---------------------------------------------------------------- worker prompt
+
+
+def contract(mode, words, restricted):
+    rules = []
+    if mode == "edit":
+        rules.append("Make only the mechanical change the task asks for. Touch no other file. "
+                     "Do not refactor, reformat or improve anything else. Run no command that "
+                     "installs, deletes or publishes anything.")
+    else:
+        rules.append("READ-ONLY: do not create, edit, move or delete files, and run no command "
+                     "that changes the project. If the task seems to need a change, describe it.")
+    rules += [
+        f"Reply in plain text, at most about {words} words. No preamble, no restating the task.",
+        "Cite evidence as path:line (for example app/models/user.rb:42). Quote at most 3 short "
+        "lines per citation. Never paste whole files or long logs.",
+        "Say 'not found' instead of guessing. Mark what you inferred but did not see as "
+        "(unverified).",
+    ]
+    if restricted:
+        rules.append("The user is a student using a learning tool. Never solve exercises, never "
+                     "write solution code and never give the fix for their errors. Report only "
+                     "facts: what files contain, what commands printed, where things are.")
+    lines = ["You are a worker for another coding agent (the lead). The lead reads only your "
+             "reply, never the raw material, so it must be short and exact.", "Rules:"]
+    lines += [f"- {rule}" for rule in rules]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- running workers
+
+
+def build_command(config, spec, mode, cwd, prompt):
+    cli = spec["cli"]
+    exe = executable(config, cli)
+    if not exe:
+        raise PirloError(f"{cli} is not installed or not on PATH")
+    model, effort = spec.get("model"), spec.get("effort")
+    timeout = int(config["workerTimeoutSeconds"])
+    if cli == "agy":
+        argv = [exe, "--output-format", "json", "--mode",
+                "accept-edits" if mode == "edit" else "plan",
+                "--print-timeout", f"{timeout}s", "--add-dir", str(cwd)]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        # The prompt must be attached to --print, or agy takes the next flag as the prompt.
+        argv.append(f"--print={prompt}")
+        return argv, None, "json"
+    if cli == "codex":
+        argv = [exe, "exec", "--json", "--disable", "multi_agent",
+                "--sandbox", "workspace-write" if mode == "edit" else "read-only",
+                "--cd", str(cwd), "--skip-git-repo-check", "--ephemeral",
+                "-c", "mcp_servers={}"]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
+        argv.append("-")
+        return argv, prompt, "jsonl"
+    if cli == "claude":
+        argv = [exe, "-p", "--output-format", "json", "--permission-mode",
+                "acceptEdits" if mode == "edit" else "plan",
+                "--strict-mcp-config", "--disallowedTools", "Agent"]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        return argv, prompt, "json"
+    adapter = config["adapters"][cli]
+    template = adapter.get("editCommand") if mode == "edit" else adapter["command"]
+    if not template:
+        raise PirloError(f"adapter '{cli}' has no editCommand, so it cannot edit")
+    via_stdin = adapter.get("prompt", "stdin") == "stdin"
+    argv = []
+    for part in template:
+        part = part.replace("{cwd}", str(cwd)).replace("{model}", model or "")
+        if "{prompt}" in part:
+            part = part.replace("{prompt}", prompt)
+            via_stdin = False
+        if part:
+            argv.append(part)
+    argv[0] = exe
+    return argv, prompt if via_stdin else None, adapter.get("format", "text")
+
+
+def text_of(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [text_of(v) for v in value]
+        return "\n".join(p for p in parts if p)
+    if isinstance(value, dict):
+        for key in ("result", "response", "text", "output", "content", "message", "answer"):
+            if key in value:
+                found = text_of(value[key])
+                if found:
+                    return found
+    return ""
+
+
+def first_number(data, keys):
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+def normalize_usage(raw):
+    """Map the usage block of any CLI to inputTokens (everything the model read,
+    cached or not), cachedTokens and outputTokens."""
+    if not isinstance(raw, dict):
+        return None
+    out = first_number(raw, ("output_tokens", "outputTokens", "completion_tokens",
+                             "candidatesTokenCount", "output"))
+    if "cache_read_input_tokens" in raw or "cache_creation_input_tokens" in raw:
+        cached = first_number(raw, ("cache_read_input_tokens",)) or 0
+        total = (first_number(raw, ("input_tokens",)) or 0) + cached + (
+            first_number(raw, ("cache_creation_input_tokens",)) or 0)
+    else:
+        total = first_number(raw, ("input_tokens", "inputTokens", "prompt_tokens",
+                                   "promptTokenCount", "input"))
+        cached = first_number(raw, ("cached_input_tokens", "cachedInputTokens",
+                                    "cachedContentTokenCount", "cached")) or 0
+    if total is None and out is None:
+        total = first_number(raw, ("total_tokens", "totalTokens", "totalTokenCount"))
+        if total is None:
+            return None
+    return {"inputTokens": total or 0, "cachedTokens": cached, "outputTokens": out or 0}
+
+
+def find_usage(data):
+    if not isinstance(data, dict):
+        return None
+    for key in ("usage", "tokenUsage", "token_usage", "usageMetadata", "stats"):
+        usage = normalize_usage(data.get(key))
+        if usage:
+            return usage
+    return None
+
+
+def parse_output(fmt, stdout):
+    """Return (text, usage, error) from a worker's stdout."""
+    stdout = stdout.strip()
+    if fmt == "text":
+        return stdout, None, None
+    if fmt == "jsonl":
+        text, error, usage = "", None, None
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type", "")
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            if item.get("type") in ("agent_message", "assistant_message") and item.get("text"):
+                text = item["text"]
+            elif kind in ("turn.failed", "error"):
+                error = text_of(event.get("error")) or text_of(event) or "worker reported an error"
+            found = find_usage(event)
+            if found and kind == "turn.completed":
+                usage = {k: (usage or {}).get(k, 0) + v for k, v in found.items()}
+            elif found and usage is None:
+                usage = found
+        if not text and not error:
+            # Other JSONL CLIs: take the last event that carries text.
+            for line in reversed(stdout.splitlines()):
+                try:
+                    text = text_of(json.loads(line))
+                except ValueError:
+                    continue
+                if text:
+                    break
+        return text.strip(), usage, None if text else error
+    data = None
+    try:
+        data = json.loads(stdout)
+    except ValueError:
+        for line in reversed(stdout.splitlines()):
+            try:
+                data = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if not isinstance(data, dict):
+        return stdout, None, None if stdout else "worker printed nothing"
+    text = text_of(data).strip()
+    error = None
+    if data.get("is_error") or (data.get("error") and not text):
+        error = text_of(data.get("error")) or text or "worker reported an error"
+    return text, find_usage(data), error
+
+
+def run_worker(config, spec, mode, cwd, prompt):
+    argv, stdin_text, fmt = build_command(config, spec, mode, cwd, prompt)
+    env = dict(os.environ, PIRLO_WORKER="1")
+    env.pop("CLAUDECODE", None)
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv, input=stdin_text, cwd=cwd, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            stdin=None if stdin_text is not None else subprocess.DEVNULL,
+            timeout=int(config["workerTimeoutSeconds"]) + 30,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "worker timed out", "text": "", "usage": None,
+                "seconds": time.monotonic() - started}
+    except OSError as error:
+        return {"ok": False, "error": str(error), "text": "", "usage": None,
+                "seconds": time.monotonic() - started}
+    text, usage, error = parse_output(fmt, proc.stdout or "")
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        error = f"worker exited with status {proc.returncode}: " + (" | ".join(tail) or error or "")
+    if not text and not error:
+        error = "worker returned an empty reply"
+    return {"ok": error is None, "error": error, "text": text, "usage": usage,
+            "seconds": time.monotonic() - started}
+
+
+# ---------------------------------------------------------------- tripwire
+
+
+def snapshot(root):
+    """Dirty files and their content hashes, to see what a worker changed."""
+    code, out = run_quiet(["git", "-C", str(root), "status", "--porcelain", "-uall"], timeout=30)
+    if code != 0:
+        return None
+    state = {}
+    for line in out.splitlines():
+        path = line[3:].split(" -> ")[-1].strip().strip('"')
+        if not path or path.startswith(".pirlo/"):
+            continue
+        try:
+            digest = hashlib.sha256((Path(root) / path).read_bytes()).hexdigest()
+        except OSError:
+            digest = "missing"
+        state[path] = digest
+    return state
+
+
+def changed_files(before, after):
+    if before is None or after is None:
+        return []
+    return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+
+# ---------------------------------------------------------------- output helpers
+
+
+def estimate_tokens(chars):
+    return (chars + 3) // 4
+
+
+def limit_reply(text, max_chars):
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + f"\n[pirlo: reply cut at {max_chars} characters; ask a narrower question]"
+
+
+def excerpt(output, log_ref, max_hits=40, tail=30):
+    """A free, deterministic digest of a long command output."""
+    lines = output.splitlines()
+    hits = [(n, line) for n, line in enumerate(lines, 1) if ERROR_LINE.search(line)]
+    parts = []
+    if hits:
+        parts.append(f"Lines that look like errors or warnings ({len(hits)} found"
+                     f"{', first ' + str(max_hits) + ' shown' if len(hits) > max_hits else ''}):")
+        parts += [f"{log_ref}:{n}: {line[:200]}" for n, line in hits[:max_hits]]
+    parts.append(f"Last {min(tail, len(lines))} lines:")
+    parts += [line[:200] for line in lines[-tail:]]
+    return "\n".join(parts)
+
+
+def append_log(config, entry):
+    if not config.get("log", True):
+        return
+    try:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def base_entry(kind, tier, spec, root, restricted, mode):
+    return {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "kind": kind,
+        "repo": str(root),
+        "tier": tier,
+        "cli": spec.get("cli"),
+        "model": spec.get("model"),
+        "effort": spec.get("effort"),
+        "mode": mode,
+        "restricted": bool(restricted),
+    }
+
+
+def footer(spec, tier, seconds, extra=""):
+    who = " ".join(x for x in (spec.get("cli"), spec.get("model"), spec.get("effort")) if x)
+    return f"[pirlo: {who}, tier {tier}, {seconds:.1f}s{extra}]"
+
+
+def prepare(args):
+    if os.environ.get("PIRLO_WORKER"):
+        raise PirloError("pirlo is already running as a worker here; do the task yourself")
+    cwd = Path(args.cwd or os.getcwd()).resolve()
+    root = repo_root(cwd)
+    config, source, active = load_config(root)
+    if not active:
+        raise PirloError("pirlo is not set up for this repository (scope local); do the task yourself")
+    restricted = restrictions(root, config.get("restrictivePlugins") or [])
+    return cwd, root, config, restricted
+
+
+def read_task(args, stdin=True):
+    task = " ".join(args.task or []).strip()
+    if not task and stdin and not sys.stdin.isatty():
+        task = sys.stdin.read().strip()
+    return task
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_ask(args, mode="read"):
+    cwd, root, config, restricted = prepare(args)
+    task = read_task(args)
+    if not task:
+        raise PirloError("give the task as an argument or on stdin")
+    notice = ""
+    if mode == "edit" and restricted:
+        mode = "read"
+        notice = (f"PIRLO_RESTRICTED: {', '.join(restricted)} is active, so workers stay "
+                  "read-only. Describe the change; do not make it.\n")
+    spec = tier_spec(config, args.tier)
+    if spec["cli"] == "native":
+        print(notice + "PIRLO_NATIVE: no external worker for this tier. Do the task yourself with "
+              "Read, Grep, Glob and read-only Bash, and reply under the same rules: short, "
+              "path:line references, no dumps." + (" Never solve exercises or give fixes: "
+              "the user is a student." if restricted else ""))
+        return 0
+    prompt = contract(mode, config["maxReplyWords"], restricted) + \
+        f"\n\nTask (working directory: {cwd}):\n{task}\n"
+    before = snapshot(root)
+    result = run_worker(config, spec, mode, cwd, prompt)
+    touched = changed_files(before, snapshot(root))
+    entry = base_entry("edit" if mode == "edit" else "ask", args.tier, spec, root, restricted, mode)
+    entry.update({"durationMs": int(result["seconds"] * 1000), "promptChars": len(prompt),
+                  "taskChars": len(task), "replyChars": len(result["text"]), "ok": result["ok"],
+                  "usage": result["usage"], "filesChanged": len(touched)})
+    if not result["ok"]:
+        entry["error"] = result["error"][:300]
+        entry["returnedChars"] = 0
+        append_log(config, entry)
+        print(notice + f"PIRLO_FAILED: {result['error'][:500]}\nDo the task yourself.")
+        return 1
+    reply = limit_reply(result["text"], int(config["maxReplyChars"]))
+    if touched:
+        label = "Files changed" if mode == "edit" else \
+            "WARNING: the worker changed files although it was read-only"
+        reply += f"\n{label}: {', '.join(touched[:20])} (review with git diff)"
+    reply = notice + reply + "\n" + footer(spec, args.tier, result["seconds"])
+    entry["returnedChars"] = len(reply)
+    append_log(config, entry)
+    print(reply)
+    return 0
+
+
+def cmd_edit(args):
+    return cmd_ask(args, mode="edit")
+
+
+def prune_runs(folder, keep=30):
+    runs = sorted(folder.glob("*.log"), key=lambda p: p.stat().st_mtime)
+    for old in runs[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def cmd_exec(args):
+    cwd, root, config, restricted = prepare(args)
+    command = list(args.command or [])
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise PirloError("give the command after --, for example: pirlo exec -- npm test")
+    shell = len(command) == 1
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            command[0] if shell else command, shell=shell, cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            errors="replace", timeout=int(config["commandTimeoutSeconds"]),
+        )
+        output, code = proc.stdout or "", proc.returncode
+    except subprocess.TimeoutExpired as error:
+        raw = error.stdout or ""
+        output = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        output += f"\n[pirlo: command killed after {config['commandTimeoutSeconds']}s]"
+        code = "timeout"
+    except OSError as error:
+        raise PirloError(f"could not run the command: {error}")
+    ran = time.monotonic() - started
+    output = ANSI.sub("", output).replace("\r\n", "\n")
+    shown = " ".join(command)
+    short = shown.splitlines()[0][:120] + (" ..." if len(shown) > 120 or "\n" in shown else "")
+    folder = ensure_local_dir(root) / "runs"
+    folder.mkdir(exist_ok=True)
+    log_file = folder / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}.log"
+    log_file.write_text(output, encoding="utf-8")
+    prune_runs(folder)
+    log_ref = os.path.relpath(log_file, cwd)
+    lines = output.count("\n") + (1 if output and not output.endswith("\n") else 0)
+    head = f"$ {short}\nexit {code}, {lines} lines, {ran:.1f}s, full output: {log_ref}"
+    try:
+        spec = tier_spec(config, args.tier)
+    except PirloError:
+        spec = {"cli": "none"}
+    entry = base_entry("exec", args.tier, spec, root, restricted, "read")
+    entry.update({"exitCode": code, "outputChars": len(output), "commandSeconds": round(ran, 1)})
+
+    if len(output) <= int(config["inlineOutputChars"]):
+        reply = f"{head}\n{output.strip()}"
+        entry.update({"cli": "none", "model": None, "effort": None, "ok": True,
+                      "replyChars": len(reply), "returnedChars": len(reply), "durationMs": 0})
+        append_log(config, entry)
+        print(reply)
+        return 0
+
+    digest = excerpt(output, log_ref)
+    if spec["cli"] in ("native", "none"):
+        reply = f"{head}\n{digest}"
+        if spec["cli"] == "native":
+            reply += f"\nPIRLO_NATIVE: read more of {log_ref} only if this is not enough."
+        entry.update({"cli": spec["cli"], "ok": True, "replyChars": len(reply),
+                      "returnedChars": len(reply), "durationMs": 0})
+        append_log(config, entry)
+        print(reply)
+        return 0
+
+    focus = read_task(args, stdin=False) or ("Did it pass? For each failure or error: path:line, the message "
+                                "in one line, and the likely cause when it is evident. Group "
+                                "repeated errors. Skip passing items and noise.")
+    if len(output) <= int(config["embedOutputChars"]):
+        material = f"Its output ({lines} lines):\n<output>\n{output}\n</output>"
+    else:
+        material = (f"Its output has {lines} lines, saved in the file {log_file}. Read the parts "
+                    "you need; start with the end and the lines that mention errors.")
+    prompt = (contract("read", config["maxReplyWords"], restricted) +
+              f"\n\nThe command `{shown}` ran in {cwd} and exited with {code}. {material}\n\n"
+              f"Task: {focus}\nWhen you cite the output, cite it as {log_ref}:<line>.\n")
+    result = run_worker(config, spec, "read", cwd, prompt)
+    entry.update({"durationMs": int(result["seconds"] * 1000), "promptChars": len(prompt),
+                  "replyChars": len(result["text"]), "ok": result["ok"],
+                  "usage": result["usage"]})
+    if result["ok"]:
+        reply = f"{head}\n{limit_reply(result['text'], int(config['maxReplyChars']))}\n" + \
+            footer(spec, args.tier, result["seconds"])
+    else:
+        entry["error"] = (result["error"] or "")[:300]
+        reply = f"{head}\n[pirlo: worker failed ({(result['error'] or '')[:200]}); free excerpt below]\n{digest}"
+    entry["returnedChars"] = len(reply)
+    append_log(config, entry)
+    print(reply)
+    return 0
+
+
+def cmd_detect(args):
+    config, _, _ = load_config(repo_root(os.getcwd()))
+    clis = detect(config)
+    if args.json:
+        print(json.dumps(clis, indent=2))
+        return 0
+    for c in clis:
+        state = "not installed" if not c["installed"] else {
+            True: "logged in", False: "NOT logged in", None: "login unknown"}[c["loggedIn"]]
+        models = ", ".join(c["models"][:12]) + (" ..." if len(c["models"]) > 12 else "")
+        print(f"{c['cli']:8} {state:14} {c['version'] or ''}")
+        if models:
+            print(f"         models: {models}")
+    return 0
+
+
+def cmd_propose(args):
+    config, _, _ = load_config(repo_root(os.getcwd()))
+    proposal, notes = propose(detect(config), args.leader)
+    print(json.dumps({"config": proposal, "notes": notes}, indent=2))
+    return 0
+
+
+def cmd_save(args):
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw)
+    except ValueError as error:
+        raise PirloError(f"config on stdin is not valid JSON: {error}")
+    data = data.get("config", data) if isinstance(data, dict) else data
+    validate_config(data)
+    data["scope"] = args.scope
+    data.setdefault("version", 1)
+    if args.scope == "user":
+        path = user_config_path()
+        write_json(path, data)
+    else:
+        root = repo_root(os.getcwd())
+        path = ensure_local_dir(root) / "config.json"
+        write_json(path, data)
+        user = read_json(user_config_path())
+        if user is None:
+            # Keep pirlo off in repositories without their own config.
+            write_json(user_config_path(), {"version": 1, "scope": "local"})
+    print(f"saved {path}")
+    return 0
+
+
+def cmd_show(args):
+    root = repo_root(os.getcwd())
+    config, source, active = load_config(root)
+    found = restrictions(root, config.get("restrictivePlugins") or [])
+    print(json.dumps({
+        "active": active, "source": source, "repo": str(root),
+        "userConfig": str(user_config_path()), "localConfig": str(local_dir(root) / "config.json"),
+        "log": str(log_path()), "readOnlyBecause": found, "config": config,
+    }, indent=2, ensure_ascii=False))
+    return 0
+
+
+def load_log(days, repo):
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days) if days else None
+    entries = []
+    try:
+        handle = log_path().open(encoding="utf-8")
+    except OSError:
+        return entries
+    with handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+                stamp = dt.datetime.fromisoformat(entry["ts"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if since and stamp < since:
+                continue
+            if repo and entry.get("repo") != repo:
+                continue
+            entries.append(entry)
+    return entries
+
+
+def summarize(entries):
+    s = {"runs": len(entries), "ok": 0, "failed": 0, "kinds": {}, "workers": {},
+         "execOutput": 0, "execReturned": 0, "execRuns": 0, "skipped": 0,
+         "askProcessed": 0, "askReturned": 0, "askRuns": 0, "reported": 0, "estimated": 0,
+         "leadCost": 0, "workerSeconds": 0.0}
+    for e in entries:
+        s["ok" if e.get("ok") else "failed"] += 1
+        kind = e.get("kind", "?")
+        s["kinds"][kind] = s["kinds"].get(kind, 0) + 1
+        returned = estimate_tokens(e.get("returnedChars", 0))
+        s["leadCost"] += returned + estimate_tokens(e.get("taskChars", 0))
+        s["workerSeconds"] += e.get("durationMs", 0) / 1000
+        if e.get("cli") in (None, "none"):
+            if kind == "exec":
+                s["skipped"] += 1
+            continue
+        key = " ".join(x for x in (e.get("cli"), e.get("model"), e.get("effort")) if x)
+        w = s["workers"].setdefault(key, {"runs": 0, "input": 0, "output": 0, "reportedRuns": 0})
+        w["runs"] += 1
+        usage = e.get("usage") or {}
+        if usage:
+            w["input"] += usage.get("inputTokens", 0)
+            w["output"] += usage.get("outputTokens", 0)
+            w["reportedRuns"] += 1
+        if kind == "exec":
+            s["execRuns"] += 1
+            s["execOutput"] += estimate_tokens(e.get("outputChars", 0))
+            s["execReturned"] += returned
+        elif e.get("ok"):
+            s["askRuns"] += 1
+            if usage:
+                s["askProcessed"] += usage.get("inputTokens", 0)
+                s["reported"] += 1
+            else:
+                s["askProcessed"] += estimate_tokens(e.get("promptChars", 0) + e.get("replyChars", 0))
+                s["estimated"] += 1
+            s["askReturned"] += returned
+    low = max(0, s["execOutput"] - s["execReturned"])
+    s["savedLow"] = low
+    s["savedHigh"] = low + max(0, s["askProcessed"] - s["askReturned"])
+    return s
+
+
+def fmt(n):
+    return f"{n:,}".replace(",", ".")
+
+
+def cmd_savings(args):
+    repo = str(repo_root(os.getcwd())) if args.here else None
+    s = summarize(load_log(args.days, repo))
+    if args.json:
+        print(json.dumps(s, indent=2))
+        return 0
+    scope = "this repository" if repo else "all repositories"
+    period = f"last {args.days} days" if args.days else "all time"
+    print(f"pirlo savings: {scope}, {period}")
+    if not s["runs"]:
+        print("No delegations logged yet.")
+        return 0
+    kinds = ", ".join(f"{k} {v}" for k, v in sorted(s["kinds"].items()))
+    print(f"Delegations: {s['runs']} ({s['ok']} ok, {s['failed']} failed): {kinds}")
+    if s["skipped"]:
+        print(f"  {s['skipped']} command runs had short output and skipped the worker.")
+    print()
+    print(f"Lead avoided reading (ESTIMATE): {fmt(s['savedLow'])} to {fmt(s['savedHigh'])} tokens")
+    print(f"  Command output digested for the lead: {fmt(s['execOutput'])} tokens in "
+          f"{s['execRuns']} runs, {fmt(s['execReturned'])} returned (from characters / 4).")
+    print(f"  Reading done by workers: up to {fmt(s['askProcessed'])} tokens in {s['askRuns']} "
+          f"runs, {fmt(s['askReturned'])} returned ({s['reported']} reported by the CLI, "
+          f"{s['estimated']} estimated). Upper bound: it includes each worker's own system prompt.")
+    print(f"  Lead's side of delegating: about {fmt(s['leadCost'])} tokens (tasks written, "
+          "replies read).")
+    if s["workers"]:
+        print()
+        print("Worker usage (their own quota):")
+        for key, w in sorted(s["workers"].items(), key=lambda item: -item[1]["runs"]):
+            tokens = (f"{fmt(w['input'])} in / {fmt(w['output'])} out reported in "
+                      f"{w['reportedRuns']} runs") if w["reportedRuns"] else "no usage reported"
+            print(f"  {key}: {w['runs']} runs, {tokens}")
+    print()
+    print("This is an estimate, not a measurement: nobody can know what the lead would have read "
+          "without pirlo. The low end counts only command output the lead never saw. Not counted: "
+          "the Claude Code relay subagent's own tokens and any rework.")
+    return 0
+
+
+def cmd_hook(args):
+    """SessionStart hook: one short reminder per session, nothing where pirlo is off."""
+    if os.environ.get("PIRLO_WORKER"):
+        return 0
+    try:
+        root = repo_root(os.getcwd())
+        config, source, active = load_config(root)
+        claude_code = args.claude_code or os.environ.get("CLAUDECODE")
+        if not active or (source == "defaults" and not claude_code):
+            return 0
+        found = restrictions(root, config.get("restrictivePlugins") or [])
+    except Exception:  # a hook must never break the session
+        return 0
+    text = ("pirlo is on in this repository. To save your quota, hand bulky low-judgment work to "
+            "the pirlo:worker subagent instead of doing it yourself: running tests, builds, "
+            "linters or LaTeX; reading long logs, docs, PDFs or many files to answer a narrow "
+            "question; wide code searches. Give it one self-contained task; it answers with "
+            "path:line references. Independent tasks can go to several workers in parallel. "
+            "Keep planning, design, decisions and small edits yourself.")
+    if found:
+        text += f" {', '.join(found)} is active, so workers stay read-only and never solve exercises."
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                             "additionalContext": text}}))
+    return 0
+
+
+def cmd_log(args):
+    print(log_path())
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="pirlo", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"pirlo {VERSION}")
+    sub = parser.add_subparsers(dest="command_name", required=True)
+
+    def worker_parser(name, help_text):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--tier", choices=TIERS, default="cheap")
+        p.add_argument("--cwd")
+        return p
+
+    p = worker_parser("ask", "a worker reads or searches and answers (read-only)")
+    p.add_argument("task", nargs="*")
+    p.set_defaults(func=cmd_ask)
+    p = worker_parser("edit", "a worker makes a mechanical edit")
+    p.add_argument("task", nargs="*")
+    p.set_defaults(func=cmd_edit)
+    p = worker_parser("exec", "run a command; a worker digests long output")
+    p.add_argument("--task", dest="task", action="append", help="what to look for in the output")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_exec)
+    p = sub.add_parser("detect", help="find installed and logged-in CLIs and their models")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_detect)
+    p = sub.add_parser("propose", help="propose a tier mapping from what is installed")
+    p.add_argument("--leader", choices=BUILTIN_CLIS, default="claude")
+    p.set_defaults(func=cmd_propose)
+    p = sub.add_parser("save", help="save a config read from stdin")
+    p.add_argument("--scope", choices=("user", "local"), required=True)
+    p.set_defaults(func=cmd_save)
+    p = sub.add_parser("show", help="show the config in effect here")
+    p.set_defaults(func=cmd_show)
+    p = sub.add_parser("savings", help="estimate the tokens the lead did not read")
+    p.add_argument("--days", type=int, default=30, help="0 for all time")
+    p.add_argument("--here", action="store_true", help="only this repository")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_savings)
+    p = sub.add_parser("hook", help="SessionStart hook for Claude Code")
+    p.add_argument("--claude-code", action="store_true", help="the lead is Claude Code")
+    p.set_defaults(func=cmd_hook)
+    p = sub.add_parser("log", help="print the path of the usage log")
+    p.set_defaults(func=cmd_log)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except PirloError as error:
+        print(f"pirlo: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

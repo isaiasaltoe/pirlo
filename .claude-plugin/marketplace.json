@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "pirlo",
+  "description": "Delega o trabalho braçal para workers mais baratos e economiza a cota do agente principal.",
+  "owner": {
+    "name": "isaiasaltoe"
+  },
+  "plugins": [
+    {
+      "name": "pirlo",
+      "description": "Delega o trabalho braçal para workers mais baratos e economiza a cota do agente principal.",
+      "source": "./"
+    }
+  ]
+}

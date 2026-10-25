@@ -1,0 +1,22 @@
+{
+  "name": "pirlo",
+  "interface": {
+    "displayName": "pirlo"
+  },
+  "plugins": [
+    {
+      "name": "pirlo",
+      "version": "0.1.0",
+      "description": "Delegates bulky reading, test runs and searches to cheaper worker CLIs.",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
