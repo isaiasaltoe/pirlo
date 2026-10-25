@@ -83,6 +83,10 @@ O setup escreve `~/.config/pirlo/config.json` (global) ou `.pirlo/config.json` (
 
 Cada worker é o CLI oficial, logado na sua própria assinatura. O pirlo não usa proxies de assinatura nem repassa tokens de login.
 
+## Inspiração
+
+O pirlo foi inspirado no [alethe-orchestrate](https://github.com/Kc1t/alethe-orchestrate-skill), do [Kauã Miguel](https://github.com/Kc1t).
+
 ## Licença
 
 MIT
