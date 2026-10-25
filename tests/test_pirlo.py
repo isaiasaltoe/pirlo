@@ -612,7 +612,7 @@ class Setup(PirloCase):
 
 class Passe(PirloCase):
     def transcript(self, folder=None):
-        folder = folder or self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.repo))
+        folder = folder or self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.repo.resolve()))
         folder.mkdir(parents=True, exist_ok=True)
         entries = [
             {"type": "user", "message": {"role": "user", "content": "fix the login test"}},

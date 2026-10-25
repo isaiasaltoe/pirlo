@@ -1296,10 +1296,16 @@ WORKER_PROMPT = "You are a worker for another coding agent"
 
 
 def newest_claude_transcript(root):
-    """The newest Claude Code session of this folder that is not a pirlo worker run."""
-    folder = claude_projects() / re.sub(r"[^A-Za-z0-9]", "-", str(root))
-    files = sorted(folder.glob("*.jsonl"), key=lambda path: path.stat().st_mtime,
-                   reverse=True) if folder.is_dir() else []
+    """The newest Claude Code session of this folder that is not a pirlo worker run. Claude Code
+    names the folder after the path it was opened in, which may differ from git's real path
+    when a symlink is involved (macOS /var is one), so every spelling of it is tried."""
+    spellings = {str(root), str(Path(root).resolve()), os.getcwd(), os.environ.get("PWD") or ""}
+    files = []
+    for spelling in filter(None, spellings):
+        folder = claude_projects() / re.sub(r"[^A-Za-z0-9]", "-", spelling)
+        if folder.is_dir():
+            files += folder.glob("*.jsonl")
+    files = sorted(set(files), key=lambda path: path.stat().st_mtime, reverse=True)
     for path in files[:10]:
         try:
             with path.open(encoding="utf-8", errors="replace") as handle:
