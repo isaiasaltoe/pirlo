@@ -224,7 +224,7 @@ class Ask(PirloCase):
         self.assertIn("app.rb:1 prints hi", out.stdout)
         self.assertIn("[pirlo: agy gemini-3.8-flash-medium, ", out.stdout)
         argv = self.calls()[0]["argv"]
-        self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertNotIn("--mode", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-medium")
         prompt = argv[-1]
         self.assertTrue(prompt.startswith("--print="))
@@ -429,7 +429,7 @@ class Fessor(PirloCase):
         out = self.pirlo("edit", "fix the exercise")
         self.assertIn("PIRLO_RESTRICTED", out.stdout)
         argv = self.calls()[0]["argv"]
-        self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertNotIn("--mode", argv)
         self.assertIn("Never solve exercises", argv[-1])
         self.assertTrue(self.log()[0]["restricted"])
 

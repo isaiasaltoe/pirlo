@@ -10,7 +10,7 @@ O nome é uma homenagem ao Andrea Pirlo, o regista que recebia a bola, decidia e
 
 ## Instalação
 
-> **Testado de verdade até agora:** o Claude Code como líder e o Antigravity como worker. O Codex já é suportado, mas ainda não foi testado com uma conta real.
+> **Testado de verdade até agora:** Claude Code e Antigravity, cada um como líder e como worker, do setup ao passe de uma IA para a outra. O Codex já é suportado, mas ainda não foi testado com uma conta real.
 
 Linux, WSL ou macOS, com Python 3.9 ou mais novo. Na pasta do projeto:
 

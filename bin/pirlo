@@ -56,7 +56,9 @@ ALLOW_RULES = ["Bash(pirlo ask *)", "Bash(pirlo digest*)", "Bash(pirlo savings*)
 # agy in --print mode denies every shell command without an allow rule, and one denial ends the
 # turn with an empty reply. Rules match by prefix, so only commands that cannot write are here
 # (no find, sed or git branch: -delete, -i and -D would match too).
+# pirlo's own read-only commands come first, so agy can also lead without asking each time.
 AGY_RULES = [f"command({c})" for c in (
+    "pirlo ask", "pirlo digest", "pirlo savings", "pirlo detect", "pirlo show", "pirlo passe",
     "git log", "git show", "git diff", "git blame", "git status", "git grep", "git ls-files",
     "cat", "head", "tail", "wc", "grep", "ls", "diff", "jq", "stat")]
 LEADER_INSTRUCTIONS = """# pirlo
@@ -736,8 +738,10 @@ def build_command(config, spec, mode, cwd, prompt):
     timeout = int(config["workerTimeoutSeconds"])
     if cli == "agy":
         prompt += agy_shell_note()
-        argv = [exe, "--output-format", "json", "--mode",
-                "accept-edits" if mode == "edit" else "plan",
+        # No --mode plan for reading: it runs agy's /plan workflow, which explores and tries
+        # commands that headless mode denies, emptying the reply. Headless agy already denies
+        # file writes and unlisted commands, and the tripwire reports any change.
+        argv = [exe, "--output-format", "json"] + (["--mode", "accept-edits"] if mode == "edit" else []) + [
                 "--print-timeout", f"{timeout}s", "--add-dir", str(cwd)]
         if model:
             argv += ["--model", model]
@@ -794,7 +798,8 @@ def agy_shell_note():
     data = read_json(agy_settings_path())
     allow = ((data or {}).get("permissions") or {}).get("allow") if isinstance(data, dict) else None
     allowed = [m.group(1) for rule in allow or [] if isinstance(rule, str)
-               for m in [re.fullmatch(r"command\(([^()/]{1,30})\)", rule)] if m]
+               for m in [re.fullmatch(r"command\(([^()/]{1,30})\)", rule)]
+               if m and not m.group(1).startswith("pirlo")]  # a worker never calls pirlo
     if allowed:
         return (f"- Shell: only commands starting with these are allowed: {', '.join(allowed)}. Any "
                 "other command is denied and ends your turn with no reply, so never try one; read "
@@ -1630,7 +1635,7 @@ def add_rules(path, rules, key):
 
 
 def allow_agy():
-    """Let agy workers run read-only shell commands, such as git log, in --print mode."""
+    """Let agy run pirlo's read-only commands as a lead and git log and the like as a worker."""
     path = agy_settings_path()
     added = add_rules(path, AGY_RULES, "allow")
     return f"added to {path}: {', '.join(added)}" if added else \
@@ -1706,12 +1711,13 @@ TEXT = {
                      "internet para falar com o worker, então sem a regra o Codex pediria aprovação "
                      "a cada delegação. A regra (~/.codex/rules/pirlo.rules) libera só os comandos "
                      "de leitura do pirlo; os comandos do seu projeto continuam no sandbox.",
-        "agy_q": "Liberar comandos de leitura (git log, git diff, cat, grep...) para o worker do "
-                 "Antigravity?",
-        "agy_why": "Rodando sem terminal, o Antigravity nega todo comando de shell, e uma negação "
-                   "deixa a resposta vazia. Isso libera só comandos que não alteram nada, para ele "
-                   "poder ler o histórico do git. Grava em ~/.gemini/antigravity-cli/settings.json.",
-        "s_agy": "  Comandos de leitura no worker do Antigravity: {v}",
+        "agy_q": "Liberar no Antigravity os comandos de leitura do pirlo e do git (git log, git "
+                 "diff, cat, grep...)?",
+        "agy_why": "Como líder, o Antigravity pediria aprovação a cada delegação. Como worker, ele "
+                   "roda sem terminal e nega todo comando de shell, e uma negação deixa a resposta "
+                   "vazia. Isso libera só comandos que não alteram nada. O `pirlo edit` continua "
+                   "pedindo aprovação. Grava em ~/.gemini/antigravity-cli/settings.json.",
+        "s_agy": "  Liberar comandos de leitura no Antigravity: {v}",
         "summary": "Resumo:", "s_leaders": "  Liderança: {v}", "s_scope": "  Escopo:  {v}",
         "s_global": "global", "s_local": "só em {root}", "s_worker": "  Workers: {v}",
         "s_allow": "  Liberar comandos de leitura no Claude Code: {v}",
@@ -1776,12 +1782,13 @@ TEXT = {
                      "reach the worker, so without the rule Codex would ask on every delegation. "
                      "The rule (~/.codex/rules/pirlo.rules) allows only pirlo's read-only "
                      "commands; your project's commands stay in the sandbox.",
-        "agy_q": "Allow read-only commands (git log, git diff, cat, grep...) for the Antigravity "
-                 "worker?",
-        "agy_why": "Running without a terminal, Antigravity denies every shell command, and one "
-                   "denial leaves the reply empty. This allows only commands that change nothing, "
-                   "so it can read the git history. Writes to ~/.gemini/antigravity-cli/settings.json.",
-        "s_agy": "  Read-only commands for the Antigravity worker: {v}",
+        "agy_q": "Allow pirlo's and git's read-only commands (git log, git diff, cat, grep...) in "
+                 "Antigravity?",
+        "agy_why": "As a lead, Antigravity would ask on every delegation. As a worker, it runs "
+                   "without a terminal and denies every shell command, and one denial leaves the "
+                   "reply empty. This allows only commands that change nothing. `pirlo edit` keeps "
+                   "asking. Writes to ~/.gemini/antigravity-cli/settings.json.",
+        "s_agy": "  Allow read-only commands in Antigravity: {v}",
         "summary": "Summary:", "s_leaders": "  Leadership: {v}", "s_scope": "  Scope:  {v}",
         "s_global": "global", "s_local": "only in {root}", "s_worker": "  Workers: {v}",
         "s_allow": "  Allow read-only commands in Claude Code: {v}",
@@ -2050,8 +2057,8 @@ def cmd_setup(args):
 
     allow = "claude" in names and talk.confirm(talk.t("allow_q"), True, why=talk.t("allow_why"))
     rules = "codex" in names and talk.confirm(talk.t("rules_q"), True, why=talk.t("rules_why"))
-    agy = any(w["cli"] == "agy" for w in workers) and \
-        talk.confirm(talk.t("agy_q"), True, why=talk.t("agy_why"))
+    uses_agy = "agy" in names or any(w["cli"] == "agy" for w in workers)
+    agy = uses_agy and talk.confirm(talk.t("agy_q"), True, why=talk.t("agy_why"))
 
     yes_no = lambda value: talk.t("v_yes" if value else "v_no")
     print()
@@ -2063,7 +2070,7 @@ def cmd_setup(args):
         talk.say("s_allow", v=yes_no(allow))
     if "codex" in names:
         talk.say("s_rules", v=yes_no(rules))
-    if any(w["cli"] == "agy" for w in workers):
+    if uses_agy:
         talk.say("s_agy", v=yes_no(agy))
     if not talk.confirm(f"\n{talk.t('apply_q')}", True):
         talk.say("nothing")
