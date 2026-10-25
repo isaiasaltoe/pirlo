@@ -31,25 +31,20 @@ No fim, ele instala o plugin em cada IA escolhida. Para mudar alguma resposta, r
   <img src="assets/como-funciona.svg" alt="Você pede ao líder para rodar os testes. O líder roda bin/rails test e manda a saída ao pirlo, ou pede para rastrear algo no código com pirlo ask. Saída curta volta direto. O resto vai para a fila de workers (agy, codex, native), que passa para o próximo quando um fica sem cota. O worker devolve as falhas com arquivo:linha ao líder." width="880">
 </p>
 
-Você não chama nada: escreve normalmente, e o líder delega.
+Você não chama nada: escreve normalmente. Pedidos como estes vão para um worker mais barato, e você recebe só o resumo:
 
-| Você pede | O líder roda |
-| --- | --- |
-| "roda os testes" | `bin/rails test 2>&1 \| pirlo digest` |
-| "o CI quebrou, o que foi?" | `gh run view --log-failed \| pirlo digest` |
-| "o que mudou nessa branch?" | `git diff main... \| pirlo digest` |
-| "onde a gente valida o token?" | `pirlo ask "onde o login valida o token?"` |
-| "renomeia `user_id` para `account_id` nos testes" | `pirlo edit "..."` |
+- "roda os testes e me diz o que quebrou"
+- "o CI quebrou, o que foi?"
+- "o que mudou nessa branch?"
+- "onde a gente valida o token do usuário?"
 
-- **Quem roda o comando é o líder**, com as permissões que você já deu a ele. O pirlo só lê a saída. Saída curta volta direto, sem chamar worker.
-- **O worker roda só leitura.** Se ele mexer em algum arquivo, a resposta avisa.
-- **Não compensa** em design ou em edições pequenas. Nesses casos, o líder faz sozinho.
+Planejamento, decisões e edições pequenas continuam com o líder.
 
 ## Quando a cota acaba
 
-**Worker sem cota.** O pirlo passa a tarefa para a próxima marca da fila, na mesma chamada, e deixa a que acabou descansando até o reset. A marca do líder fica por último, para poupar a cota dele. `pirlo show` mostra a fila e as cotas.
+**Worker sem cota.** O pirlo passa o trabalho para a próxima IA da fila sozinho, sem você perceber.
 
-**Líder sem cota.** No Claude Code, o pirlo monta sozinho o `.pirlo/passe.md`, com o que você pediu, a última resposta e os arquivos alterados, e avisa. Abra outra IA na mesma pasta e diga "continua". Nos outros líderes, rode `pirlo passe`.
+**Líder sem cota.** O pirlo deixa tudo pronto para outra IA continuar: abra outra IA na mesma pasta e diga "continua". No Claude Code isso é automático; nas outras IAs, rode `pirlo passe` antes.
 
 ## Comandos
 
@@ -61,7 +56,7 @@ Você não chama nada: escreve normalmente, e o líder delega.
 | `pirlo passe` | deixa o trabalho pronto para outra IA continuar |
 | `pirlo detect` | lista as IAs instaladas, o login e os modelos, sem gastar cota |
 
-A economia é uma **estimativa**, porque não dá para saber quanto o líder teria lido sem o pirlo. Cada delegação grava uma linha em `~/.config/pirlo/usage.jsonl`, sem custar tokens.
+A economia é uma **estimativa**, porque não dá para saber quanto o líder teria lido sem o pirlo.
 
 ## Configuração
 
@@ -82,25 +77,11 @@ O setup escreve `~/.config/pirlo/config.json` (global) ou `.pirlo/config.json` (
 | --- | --- |
 | `workers` | a fila, em ordem. `cli` pode ser `agy`, `codex`, `claude`, `native` (o subagente do Claude Code) ou um adaptador |
 | `switchAt` | a partir de quantos % da cota uma marca vai para o fim da fila (90) |
-| `inlineOutputChars` | até quantos caracteres a saída volta direto, sem worker (2500) |
-| `restrictivePlugins` | plugins que deixam os workers só leitura (`["fessor"]`) |
 | `adapters` | outro CLI como worker, como `{"meu-cli": {"command": ["meu-cli", "--print", "{prompt}"]}}` |
-
-## Compatível com o fessor
-
-Com o [fessor](https://github.com/isaiasaltoe/fessor) ativo no projeto, os workers ficam só leitura e nunca resolvem exercícios.
 
 ## Termos de serviço
 
 Cada worker é o CLI oficial, logado na sua própria assinatura. O pirlo não usa proxies de assinatura nem repassa tokens de login.
-
-## Desenvolvimento
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-É uma versão inicial. O Antigravity e o Codex como workers ainda não foram testados com contas reais.
 
 ## Licença
 
