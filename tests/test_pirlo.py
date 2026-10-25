@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,8 @@ class PirloCase(unittest.TestCase):
             "PIRLO_HOME": str(self.home / ".config" / "pirlo"),
             "STUB_RECORD": str(self.record),
             "PIRLO_NO_NOTIFY": "1",
+            # The test runner may itself run inside Claude Code: only the variables set here count.
+            "PIRLO_NO_PROCESS_LEAD": "1",
         }
 
     def tearDown(self):
@@ -95,7 +98,7 @@ class DetectAndPropose(PirloCase):
 
     def test_propose_puts_the_leads_brands_last(self):
         out = json.loads(self.pirlo("propose", "--leader", "agy,codex").stdout)
-        self.assertEqual([w["cli"] for w in out["config"]["workers"]], ["claude", "agy", "codex"])
+        self.assertEqual([w["cli"] for w in out["config"]["workers"]], ["claude", "codex", "agy"])
 
     def test_propose_for_any_lead(self):
         out = json.loads(self.pirlo("propose", "--leader", "kimi").stdout)
@@ -119,6 +122,100 @@ class DetectAndPropose(PirloCase):
         self.assertEqual(out["config"]["workers"], [{"cli": "native"}])
 
 
+class Antigravity(PirloCase):
+    """agy's real output, as captured from agy 1.4.7."""
+
+    def test_bad_model_reports_agys_message_not_the_model_list(self):
+        self.save(AUTHOR_WORKER)
+        out = self.pirlo("ask", "x", STUB_AGY="bad-model")
+        self.assertIn("PIRLO_FAILED", out.stdout)
+        self.assertIn("status 1: invalid model selection", out.stdout)
+
+    def test_prompt_says_the_shell_is_off_without_rules(self):
+        self.save(AUTHOR_WORKER)
+        self.pirlo("ask", "x")
+        self.assertIn("You cannot run shell commands", self.calls()[0]["argv"][-1])
+
+    def test_allow_agy_adds_read_only_rules_and_the_prompt_lists_them(self):
+        settings = self.home / ".gemini" / "antigravity-cli" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"model": "x", "permissions": {"allow": ["command(ls)"]}}))
+        out = self.pirlo("allow", "agy")
+        self.assertIn("command(git log)", out.stdout)
+        data = json.loads(settings.read_text())
+        self.assertEqual(data["model"], "x")
+        self.assertEqual(data["permissions"]["allow"].count("command(ls)"), 1)
+        self.assertNotIn("command(find)", data["permissions"]["allow"])
+        self.assertIn("already", self.pirlo("allow", "agy").stdout)
+        self.save(AUTHOR_WORKER)
+        self.pirlo("ask", "x")
+        self.assertIn("only commands starting with these are allowed: ls, git log", self.calls()[0]["argv"][-1])
+
+    def test_print_timeout_says_why_the_reply_is_empty(self):
+        self.save(AUTHOR_WORKER)
+        out = self.pirlo("ask", "x", STUB_AGY="timeout")
+        self.assertIn("empty reply: [agy] print timeout", out.stdout)
+
+
+class LeadDetection(PirloCase):
+    def lead(self, cwd=None, **env):
+        shown = json.loads(self.pirlo("show", cwd=cwd, **env).stdout)
+        return shown["lead"], shown["leadFoundBy"]
+
+    def fake_lead(self, name):
+        """A script named like an agent CLI that runs pirlo, as that CLI would."""
+        folder = Path(self.tmp.name) / f"lead-{name}"
+        folder.mkdir()
+        script = folder / name
+        script.write_text(f'#!/bin/sh\n"{sys.executable}" "{PIRLO}" show\n')
+        script.chmod(0o755)
+        return script
+
+    def run_under(self, name, **env):
+        full = dict(self.env, **env)
+        full.pop("PIRLO_NO_PROCESS_LEAD")
+        out = subprocess.run([str(self.fake_lead(name))], cwd=self.repo, env=full,
+                             capture_output=True, text=True, timeout=60)
+        shown = json.loads(out.stdout)
+        return shown["lead"], shown["leadFoundBy"]
+
+    def test_no_lead(self):
+        self.assertEqual(self.lead(), (None, None))
+
+    def test_variables_of_each_lead(self):
+        self.assertEqual(self.lead(CLAUDECODE="1"), ("claude", "CLAUDECODE"))
+        self.assertEqual(self.lead(CODEX_THREAD_ID="t"), ("codex", "CODEX_THREAD_ID"))
+        self.assertEqual(self.lead(ANTIGRAVITY_CONVERSATION_ID="c"), ("agy", "ANTIGRAVITY_CONVERSATION_ID"))
+
+    def test_ai_agent_convention(self):
+        self.assertEqual(self.lead(AI_AGENT="claude-code_2-1-310_agent"), ("claude", "AI_AGENT"))
+        self.assertEqual(self.lead(AI_AGENT="opencode_1-2_agent"), ("opencode", "AI_AGENT"))
+
+    def test_pirlo_lead_wins(self):
+        self.assertEqual(self.lead(PIRLO_LEAD="kimi", CLAUDECODE="1"), ("kimi", "PIRLO_LEAD"))
+
+    @unittest.skipUnless(shutil.which("ps"), "needs ps")
+    def test_any_known_cli_found_in_the_process_tree(self):
+        self.assertEqual(self.run_under("gemini"), ("gemini", "process"))
+
+    @unittest.skipUnless(shutil.which("ps"), "needs ps")
+    def test_the_nearest_lead_beats_inherited_variables(self):
+        # Codex opened in a Claude Code terminal inherits CLAUDECODE, but Codex is the lead.
+        self.assertEqual(self.run_under("codex", CLAUDECODE="1"), ("codex", "process"))
+
+    def test_native_goes_last_when_another_ai_leads(self):
+        data = {"version": 3, "workers": [{"cli": "native"}, AUTHOR_WORKER]}
+        self.pirlo("save", "--scope", "user", stdin=json.dumps(data))
+        out = self.pirlo("ask", "x", PIRLO_LEAD="agy")
+        self.assertIn("stub reply from agy", out.stdout)
+
+    def test_codex_lead_gets_no_native_fallback(self):
+        self.save({"cli": "agy", "model": "m"})
+        out = self.pirlo("ask", "x", CODEX_THREAD_ID="t", STUB_FAIL="1")
+        self.assertIn("PIRLO_FAILED", out.stdout)
+        self.assertNotIn("PIRLO_NATIVE", out.stdout)
+
+
 class Ask(PirloCase):
     def test_agy_read_only_call(self):
         self.save(AUTHOR_WORKER)
@@ -136,7 +233,7 @@ class Ask(PirloCase):
         self.assertIn("where is the greeting?", prompt)
         entry = self.log()[0]
         self.assertEqual((entry["kind"], entry["cli"], entry["ok"]), ("ask", "agy", True))
-        self.assertEqual(entry["usage"], {"inputTokens": 5200, "cachedTokens": 0, "outputTokens": 140})
+        self.assertEqual(entry["usage"], {"inputTokens": 5200, "cachedTokens": 1200, "outputTokens": 140})
         for key in ("ts", "repo", "model", "durationMs", "promptChars", "replyChars"):
             self.assertIn(key, entry)
 
@@ -510,8 +607,8 @@ class Setup(PirloCase):
         return self.pirlo("setup", stdin="\n".join([lang] + answers) + "\n", cwd=cwd,
                           PIRLO_MARKETPLACE="/market", PATH=path)
 
-    def test_claude_and_codex_local(self):
-        out = self.setup_run(["1,2", "2", "", "", "", "", ""])
+    def test_three_ais_local(self):
+        out = self.setup_run(["1,2,3", "2", "", "", "", "", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("sandbox", out.stdout)
         argvs = [(c["cli"], c["argv"]) for c in self.calls()]
@@ -520,26 +617,32 @@ class Setup(PirloCase):
         self.assertIn(("codex", ["plugin", "add", "pirlo@pirlo"]), argvs)
         config = json.loads((self.repo / ".pirlo" / "config.json").read_text())
         self.assertEqual(config["scope"], "local")
-        self.assertEqual(config["leaders"], ["claude", "codex"])
+        self.assertEqual(config["leaders"], ["claude", "codex", "agy"])
+        # The lightest model of each AI, from the last lead to the main one.
         self.assertEqual([w["cli"] for w in config["workers"]], ["agy", "codex", "native"])
         self.assertEqual(config["workers"][0], AUTHOR_WORKER)
+        agy = json.loads((self.home / ".gemini" / "antigravity-cli" / "settings.json").read_text())
+        self.assertIn("command(git log)", agy["permissions"]["allow"])
+        self.assertIn("# pirlo", (self.repo / "AGENTS.md").read_text())
         self.assertIn("Antigravity", out.stdout)
         rules = (self.home / ".codex" / "rules" / "pirlo.rules").read_text()
         self.assertEqual(rules, (ROOT / "portable" / "pirlo.rules").read_text())
         allow = json.loads((self.home / ".claude" / "settings.json").read_text())["permissions"]["allow"]
         self.assertIn("Bash(pirlo digest*)", allow)
 
-    def test_global_scope_and_picking_another_worker(self):
-        out = self.setup_run(["1", "1", "3,1", "", "n", ""])
+    def test_leadership_order_sets_the_workers(self):
+        out = self.setup_run(["3,1", "1", "n", "n", "", "", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Antigravity → Claude Code", out.stdout)
         config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
+        self.assertEqual(config["leaders"], ["agy", "claude"])
         self.assertEqual((config["workers"], config["scope"]), ([{"cli": "native"}, AUTHOR_WORKER], "user"))
         install = [c["argv"] for c in self.calls() if c["argv"][:2] == ["plugin", "install"]]
         self.assertEqual(install[0][-2:], ["--scope", "user"])
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
 
     def test_nothing_changes_when_declined(self):
-        out = self.setup_run(["1,2", "2", "", "", "", "", "n"])
+        out = self.setup_run(["1,2", "2", "", "", "", "n"])
         self.assertEqual(out.returncode, 1)
         self.assertIn("Nada foi alterado", out.stdout)
         self.assertEqual(self.calls(), [])
@@ -547,31 +650,31 @@ class Setup(PirloCase):
         self.assertFalse((self.home / ".config" / "pirlo").exists())
 
     def test_other_lead_in_this_repo_uses_agents_md(self):
-        out = self.setup_run(["3", "2", "", "", ""])
+        out = self.setup_run(["4,3", "2", "", "", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("| pirlo digest", (self.repo / "AGENTS.md").read_text())
         self.assertIn("/AGENTS.md", (self.repo / ".git" / "info" / "exclude").read_text())
-        self.setup_run(["3", "2", "", "", ""])
+        self.setup_run(["4,3", "2", "", "", ""])
         self.assertEqual((self.repo / "AGENTS.md").read_text().count("# pirlo"), 1)
 
     def test_other_lead_outside_a_repo_installs_skills(self):
         outside = Path(self.tmp.name) / "outside"
         outside.mkdir()
         skills = Path(self.tmp.name) / "skills"
-        out = self.setup_run(["3", "", "", "", str(skills)], cwd=outside)
+        out = self.setup_run(["4,3", "", "", "", str(skills)], cwd=outside)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("global", out.stdout)
         for name in ("pirlo", "pirlo-setup", "pirlo-savings"):
             self.assertTrue((skills / name / "SKILL.md").is_file())
 
     def test_codex_rule_can_be_declined(self):
-        out = self.setup_run(["2", "1", "", "", "n", ""])
+        out = self.setup_run(["2", "1", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertFalse((self.home / ".codex" / "rules" / "pirlo.rules").exists())
         self.assertIn(("codex", ["plugin", "add", "pirlo@pirlo"]), [(c["cli"], c["argv"]) for c in self.calls()])
 
     def test_english(self):
-        out = self.setup_run(["1", "1", "", "", "", ""], lang="2")
+        out = self.setup_run(["1", "1", "", ""], lang="2")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("Which AIs do you want", out.stdout)
         self.assertIn("Done.", out.stdout)
@@ -589,7 +692,7 @@ class Setup(PirloCase):
         self.assertEqual(module.CODEX_RULES, (ROOT / "portable" / "pirlo.rules").read_text())
 
     def test_changing_a_model(self):
-        out = self.setup_run(["1", "1", "1", "s", "6", "n", ""])
+        out = self.setup_run(["3", "1", "s", "6", "n", "", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
         self.assertEqual(config["workers"], [{"cli": "agy", "model": "gemini-4-argon-high"}])
@@ -599,13 +702,13 @@ class Setup(PirloCase):
         bin_dir.mkdir()
         link(bin_dir, "gemini")
         path = os.pathsep.join([str(bin_dir), str(STUBS), os.path.dirname(sys.executable), "/usr/bin", "/bin"])
-        out = self.pirlo("setup", stdin="1\n4\n2\n\n\n\n", PIRLO_MARKETPLACE="/market", PATH=path)
+        out = self.pirlo("setup", stdin="1\n4,3\n2\n\n\n\n", PIRLO_MARKETPLACE="/market", PATH=path)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("Gemini CLI", out.stdout)
         self.assertIn("# pirlo", (self.repo / "GEMINI.md").read_text())
 
     def test_invalid_answer_asks_again(self):
-        out = self.setup_run(["9", "1", "1", "", "", "", ""])
+        out = self.setup_run(["9", "1", "1", "", ""])
         self.assertIn("Opção inválida", out.stdout)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
@@ -645,6 +748,19 @@ class Passe(PirloCase):
         self.assertNotIn("elsewhere", text)
         self.assertIn("M app.rb", text)
         self.assertIn("continue", out.stdout)
+
+    def test_the_session_named_by_claude_code_wins_over_the_newest(self):
+        path = self.transcript()
+        newer = path.parent / "other.jsonl"
+        newer.write_text(json.dumps({"type": "user", "message": {"content": "another session"}}) + "\n")
+        os.utime(newer, (time.time() + 60, time.time() + 60))
+        self.pirlo("passe", "--lead", "claude", CLAUDE_CODE_SESSION_ID="session")
+        self.assertIn("fix the login test", (self.repo / ".pirlo" / "passe.md").read_text())
+
+    def test_passe_names_the_next_lead(self):
+        self.save(AUTHOR_WORKER, leaders=["claude", "codex", "agy"])
+        self.assertIn("Open Codex here", self.pirlo("passe", "--lead", "claude").stdout)
+        self.assertIn("Open Claude Code here", self.pirlo("passe", "--lead", "agy").stdout)
 
     def test_worker_sessions_are_skipped(self):
         path = self.transcript()

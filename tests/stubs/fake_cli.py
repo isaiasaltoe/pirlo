@@ -9,6 +9,7 @@ It mimics the non-interactive output of each CLI. Environment variables steer it
   STUB_CLAUDE_USED  share of claude's 5-hour window in its rate_limit_event (default 0.1)
   STUB_LOGGED_OUT report "not logged in"
   STUB_WRITE      path of a file the worker creates, to trip the read-only check
+  STUB_AGY        "bad-model": agy's invalid-model error; "timeout": its --print-timeout reply
 """
 
 import json
@@ -44,14 +45,17 @@ def main():
         print(json.dumps({"models": models}))
         return 0
     if cli == "agy" and argv[:1] == ["models"]:
+        # As agy 1.4.7 prints it: a progress line on stderr, then "slug<TAB>name" lines.
+        print("Fetching available models...", file=sys.stderr)
         if logged_out:
-            print("Error: not logged in. Run agy login.", file=sys.stderr)
+            print("Error: Please sign in to view available models. Launch the CLI without "
+                  "arguments to sign in.", file=sys.stderr)
             return 1
-        print("Available models:")
         for model in ("gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
                       "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
                       "claude-opus-5-5-high", "claude-sonnet-5-5-medium", "gpt-oss-120b-medium"):
-            print(f"  {model}")
+            name = model.replace("-", " ").title()
+            print(f"{model}\t{name}")
         return 0
 
     stdin = None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
@@ -65,8 +69,22 @@ def main():
         print(os.environ.get("STUB_FAIL_MSG", "Error: quota exhausted"), file=sys.stderr)
         return 1
     if cli == "agy":
-        print(json.dumps({"response": reply, "conversationId": "c1",
-                          "usage": {"inputTokens": 5200, "outputTokens": 140}}))
+        usage = {"input_tokens": 5200, "output_tokens": 140, "thinking_tokens": 60,
+                 "cache_read_tokens": 1200, "total_tokens": 5340}
+        mode = os.environ.get("STUB_AGY")
+        if mode == "bad-model":
+            error = "invalid model selection: model x is not recognized\nAvailable models:\n  Gemini 4 Argon (High)"
+            print(json.dumps({"conversation_id": "", "status": "ERROR", "response": "", "error": error,
+                              "usage": dict(usage, input_tokens=0, output_tokens=0)}))
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        if mode == "timeout":
+            print(json.dumps({"conversation_id": "c1", "status": "SUCCESS", "response": "", "usage": usage}))
+            print("[agy] print timeout after 1s with turn in progress; returning partial output",
+                  file=sys.stderr)
+            return 0
+        print(json.dumps({"conversation_id": "c1", "status": "SUCCESS", "response": reply + "\n",
+                          "duration_seconds": 2.1, "num_turns": 1, "usage": usage}))
     elif cli == "codex":
         events = [
             {"type": "thread.started", "thread_id": "t1"},

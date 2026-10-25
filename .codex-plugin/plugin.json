@@ -1,6 +1,6 @@
 {
   "name": "pirlo",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Delegates bulky reading, test runs and searches to cheaper worker CLIs, so the lead agent saves its quota.",
   "author": {
     "name": "isaiasaltoe",

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 470" width="880" height="470" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 330" width="880" height="330" role="img" aria-labelledby="t d">
   <title id="t">Como o pirlo funciona</title>
-  <desc id="d">Você conversa com o líder. O líder roda os testes e manda a saída ao pirlo, ou pede para rastrear algo no código. O pirlo devolve saídas curtas direto e manda o resto para a fila de workers, que troca de marca quando uma fica sem cota. O worker devolve um resumo com as falhas em arquivo:linha. Quando a cota do líder acaba, o pirlo deixa um passe pronto para outra IA.</desc>
+  <desc id="d">Você pede ao líder para rodar os testes. O líder passa o trabalho braçal aos workers, os modelos leves das suas IAs, e recebe só um resumo com as falhas em arquivo:linha. Se um worker fica sem cota, o próximo assume. Se o líder fica sem cota, a próxima IA continua de onde ele parou.</desc>
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#475569"/>
@@ -12,81 +12,54 @@
       text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
       .h { font-size: 17px; font-weight: 700; }
       .s { font-size: 13px; fill: #334155; }
-      .m { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #1e293b; }
-      .t { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #e2e8f0; }
-      .p { fill: #7dd3fc; }
-      .c { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #86efac; }
-      .r { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; fill: #14532d; }
       .l { font-size: 12.5px; fill: #475569; }
+      .m { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #1e293b; }
+      .r { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; fill: #14532d; }
       .box { stroke-width: 1.5; }
       .line { stroke: #475569; stroke-width: 1.8; fill: none; }
       .back { stroke: #15803d; stroke-width: 1.8; fill: none; stroke-dasharray: 6 5; }
     </style>
   </defs>
 
-  <rect x="1" y="1" width="878" height="468" rx="18" fill="#f8fafc" stroke="#e2e8f0"/>
+  <rect x="1" y="1" width="878" height="328" rx="18" fill="#f8fafc" stroke="#e2e8f0"/>
 
   <!-- você -->
-  <rect class="box" x="30" y="60" width="120" height="70" rx="12" fill="#ffffff" stroke="#94a3b8"/>
-  <text class="h" x="90" y="92" text-anchor="middle">você</text>
-  <text class="s" x="90" y="113" text-anchor="middle">"roda os testes"</text>
-  <path class="line" d="M150 95 H 205" marker-end="url(#a)"/>
+  <rect class="box" x="30" y="50" width="140" height="80" rx="12" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="h" x="100" y="84" text-anchor="middle">você</text>
+  <text class="s" x="100" y="106" text-anchor="middle">"roda os testes"</text>
+  <path class="line" d="M170 90 H 215" marker-end="url(#a)"/>
 
   <!-- líder -->
-  <rect class="box" x="210" y="40" width="210" height="110" rx="12" fill="#ffffff" stroke="#94a3b8"/>
-  <text class="h" x="315" y="70" text-anchor="middle">líder</text>
-  <text class="s" x="315" y="92" text-anchor="middle">Claude Code, Codex,</text>
-  <text class="s" x="315" y="110" text-anchor="middle">Antigravity, Kimi...</text>
-  <text class="s" x="315" y="134" text-anchor="middle">planeja e decide</text>
+  <rect class="box" x="220" y="40" width="200" height="100" rx="12" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="h" x="320" y="70" text-anchor="middle">líder</text>
+  <text class="s" x="320" y="92" text-anchor="middle">a IA que você usa</text>
+  <text class="s" x="320" y="116" text-anchor="middle">planeja e decide</text>
 
-  <!-- terminal do pirlo -->
-  <path class="line" d="M420 95 H 485" marker-end="url(#a)"/>
-  <rect x="490" y="26" width="370" height="140" rx="10" fill="#0f172a"/>
-  <path d="M490 36 a10 10 0 0 1 10 -10 h350 a10 10 0 0 1 10 10 v16 h-370 z" fill="#1e293b"/>
-  <circle cx="506" cy="39" r="5" fill="#f87171"/>
-  <circle cx="522" cy="39" r="5" fill="#fbbf24"/>
-  <circle cx="538" cy="39" r="5" fill="#4ade80"/>
-  <text class="t" x="675" y="43" text-anchor="middle" fill-opacity="0.8">pirlo</text>
-  <text class="t" x="506" y="78"><tspan class="p">$</tspan> bin/rails test 2&gt;&amp;1 | pirlo digest</text>
-  <text class="t" x="506" y="104"><tspan class="p">$</tspan> pirlo ask "onde o login valida o token?"</text>
-  <text class="c" x="506" y="134"># saída curta? volta direto, sem worker</text>
-  <text class="c" x="506" y="153"># o resto vai para a fila de workers</text>
+  <!-- trabalho braçal -->
+  <path class="line" d="M420 75 H 525" marker-end="url(#a)"/>
+  <text class="l" x="472" y="64" text-anchor="middle">trabalho braçal</text>
 
-  <!-- fila de workers -->
-  <path class="line" d="M675 166 V 205" marker-end="url(#a)"/>
-  <rect class="box" x="300" y="210" width="560" height="120" rx="12" fill="#ffffff" stroke="#94a3b8"/>
-  <text class="h" x="320" y="236">fila de workers, uma marca por vez</text>
-  <text class="l" x="320" y="255">CLIs oficiais, só leitura</text>
-  <text class="l" x="840" y="236" text-anchor="end">sem cota? passa para o próximo</text>
+  <!-- workers -->
+  <rect class="box" x="530" y="40" width="320" height="100" rx="12" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="h" x="550" y="66">workers</text>
+  <text class="l" x="550" y="84">os modelos leves das suas IAs</text>
+  <rect x="550" y="98" width="88" height="30" rx="8" fill="#fff4e0" stroke="#f5a524"/>
+  <text class="m" x="594" y="118" text-anchor="middle">Gemini</text>
+  <rect x="646" y="98" width="88" height="30" rx="8" fill="#e7f8ef" stroke="#34c27a"/>
+  <text class="m" x="690" y="118" text-anchor="middle">GPT</text>
+  <rect x="742" y="98" width="88" height="30" rx="8" fill="#fdecec" stroke="#e45b5b"/>
+  <text class="m" x="786" y="118" text-anchor="middle">Haiku</text>
 
-  <rect x="320" y="270" width="140" height="40" rx="9" fill="#fff4e0" stroke="#f5a524"/>
-  <text class="m" x="390" y="295" text-anchor="middle">agy · Gemini</text>
-  <path class="line" d="M460 290 H 495" marker-end="url(#a)"/>
-  <rect x="500" y="270" width="140" height="40" rx="9" fill="#e7f8ef" stroke="#34c27a"/>
-  <text class="m" x="570" y="295" text-anchor="middle">codex · GPT</text>
-  <path class="line" d="M640 290 H 675" marker-end="url(#a)"/>
-  <rect x="680" y="270" width="160" height="40" rx="9" fill="#fdecec" stroke="#e45b5b"/>
-  <text class="m" x="760" y="295" text-anchor="middle">native · Haiku</text>
+  <!-- resumo de volta -->
+  <path class="back" d="M690 140 V 201 H 656" marker-end="url(#g)"/>
+  <rect x="450" y="168" width="200" height="66" rx="10" fill="#ecfdf3" stroke="#15803d" stroke-width="1.5"/>
+  <text class="r" x="466" y="192" font-weight="700">só o resumo:</text>
+  <text class="r" x="466" y="214">auth_test.rb:42 falhou</text>
+  <path class="back" d="M450 201 H 320 V 146" marker-end="url(#g)"/>
 
-  <!-- resposta que volta ao líder -->
-  <path class="back" d="M300 290 H 268" marker-end="url(#g)"/>
-  <rect x="30" y="178" width="236" height="152" rx="10" fill="#ecfdf3" stroke="#15803d" stroke-width="1.5"/>
-  <text class="r" x="44" y="202" font-weight="700">2 falhas:</text>
-  <text class="r" x="44" y="223">test/auth_test.rb:42</text>
-  <text class="r" x="58" y="241">esperava 200, veio 302</text>
-  <text class="r" x="44" y="262">app/models/user.rb:17</text>
-  <text class="r" x="58" y="280">token nil no login</text>
-  <text class="r" x="44" y="312" fill-opacity="0.75">[pirlo: agy flash, 8.1s]</text>
-  <path class="back" d="M232 178 V 156" marker-end="url(#g)"/>
-
-  <!-- rodapé: log e passe -->
-  <rect x="30" y="360" width="405" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-  <text class="h" x="50" y="388">log e economia</text>
-  <text class="s" x="50" y="410">cada delegação vira uma linha em usage.jsonl;</text>
-  <text class="s" x="50" y="428">pirlo savings estima o que o líder não leu</text>
-
-  <rect x="455" y="360" width="405" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-  <text class="h" x="475" y="388">passe</text>
-  <text class="s" x="475" y="410">a cota do líder acabou? .pirlo/passe.md fica pronto</text>
-  <text class="s" x="475" y="428">e a próxima IA continua de onde parou</text>
+  <!-- trocas de cota -->
+  <rect x="30" y="258" width="400" height="50" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="s" x="50" y="288"><tspan font-weight="700">worker sem cota?</tspan> o próximo assume sozinho</text>
+  <rect x="450" y="258" width="400" height="50" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+  <text class="s" x="470" y="288"><tspan font-weight="700">líder sem cota?</tspan> a próxima IA continua de onde parou</text>
 </svg>

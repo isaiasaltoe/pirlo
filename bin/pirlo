@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 BUILTIN_CLIS = ("agy", "codex", "claude")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULTS = {
@@ -53,6 +53,12 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # Read-only commands only: pirlo never runs the lead's commands, and edit keeps asking.
 ALLOW_RULES = ["Bash(pirlo ask *)", "Bash(pirlo digest*)", "Bash(pirlo savings*)",
                "Bash(pirlo detect*)", "Bash(pirlo show*)", "Bash(pirlo passe*)"]
+# agy in --print mode denies every shell command without an allow rule, and one denial ends the
+# turn with an empty reply. Rules match by prefix, so only commands that cannot write are here
+# (no find, sed or git branch: -delete, -i and -D would match too).
+AGY_RULES = [f"command({c})" for c in (
+    "git log", "git show", "git diff", "git blame", "git status", "git grep", "git ls-files",
+    "cat", "head", "tail", "wc", "grep", "ls", "diff", "jq", "stat")]
 LEADER_INSTRUCTIONS = """# pirlo
 
 Hand bulky, low-judgment work to a cheaper worker with the `pirlo` command instead of doing it \
@@ -211,16 +217,80 @@ def spec_name(spec):
     return " ".join(x for x in (spec.get("cli"), spec.get("model"), spec.get("effort")) if x)
 
 
-def lead_brand():
-    """The CLI pirlo was called from, when it says so in the environment."""
-    if os.environ.get("PIRLO_LEAD"):
-        return os.environ["PIRLO_LEAD"]
-    if os.environ.get("CLAUDECODE"):
-        return "claude"
-    if any(os.environ.get(key) for key in ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX",
-                                           "CODEX_SANDBOX_NETWORK_DISABLED")):
-        return "codex"
+# Variables each lead sets for the commands it runs. AI_AGENT is a cross-tool convention
+# (Claude Code sets "claude-code_<version>_agent").
+LEAD_ENV = (
+    ("claude", ("CLAUDECODE",)),
+    ("codex", ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX",
+               "CODEX_SANDBOX_NETWORK_DISABLED")),
+    ("agy", ("ANTIGRAVITY_CONVERSATION_ID",)),
+)
+AI_AGENT_NAMES = {"claude-code": "claude", "codex": "codex", "antigravity": "agy"}
+INTERPRETERS = ("node", "nodejs", "bun", "deno", "python", "sh", "bash", "zsh", "dash")
+
+
+def process_table():
+    """{pid: (ppid, program name)} from one ps call; empty where ps is missing or blocked."""
+    if os.environ.get("PIRLO_NO_PROCESS_LEAD"):  # tests: the runner's own tree must not count
+        return {}
+    code, out = run_quiet(["ps", "-eo", "pid=,ppid=,args="], timeout=5)
+    table = {}
+    for line in out.splitlines() if code == 0 else []:
+        parts = line.split()
+        if len(parts) < 3 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        # Node CLIs (gemini, qwen...) show up as "node /path/to/gemini": take the script's name.
+        names = [os.path.basename(part) for part in parts[2:4]]
+        if names[0].lower().rstrip("0123456789.") in INTERPRETERS and len(names) > 1:
+            names = names[1:]
+        table[int(parts[0])] = (int(parts[1]), names[0])
+    return table
+
+
+def lead_from_processes():
+    """The nearest known agent CLI among pirlo's ancestors. It wins over inherited variables,
+    so Codex opened inside a Claude Code terminal is still seen as Codex."""
+    known = {name for name, _, _ in KNOWN_LEADS}
+    table, pid = process_table(), os.getppid()
+    for _ in range(40):
+        if pid not in table:
+            return None
+        pid, name = table[pid]
+        if name in known:
+            return name
     return None
+
+
+_LEAD = []
+
+
+def detect_lead():
+    """(brand, how) of the lead that called pirlo: PIRLO_LEAD, then the process tree, then
+    the variables the lead sets. (None, None) when nothing says."""
+    if _LEAD:
+        return _LEAD[0]
+    found = (None, None)
+    if os.environ.get("PIRLO_LEAD"):
+        found = (os.environ["PIRLO_LEAD"], "PIRLO_LEAD")
+    if not found[0]:
+        name = lead_from_processes()
+        found = (name, "process") if name else found
+    for name, keys in LEAD_ENV if not found[0] else ():
+        key = next((key for key in keys if os.environ.get(key)), None)
+        if key:
+            found = (name, key)
+            break
+    agent = os.environ.get("AI_AGENT", "").lower()
+    if not found[0] and agent:
+        found = (next((brand for prefix, brand in AI_AGENT_NAMES.items() if agent.startswith(prefix)),
+                      agent.split("_")[0]), "AI_AGENT")
+    _LEAD.append(found)
+    return found
+
+
+def lead_brand():
+    """The CLI pirlo was called from, or None."""
+    return detect_lead()[0]
 
 
 def utcnow():
@@ -348,7 +418,7 @@ def worker_chain(config, state):
     resting brands left out. Returns (chain, notes)."""
     specs = worker_list(config)
     if not specs:
-        if os.environ.get("CLAUDECODE"):
+        if lead_brand() == "claude":
             return [{"cli": "native"}], []
         raise PirloError("no worker is configured; run `pirlo setup`")
     now, lead = utcnow(), lead_brand()
@@ -363,7 +433,10 @@ def worker_chain(config, state):
         used = used_percent(reading_for(name, state), now)
         if used >= switch_at:
             notes.append(f"{name} last: {used:g}% of its quota used")
-        ranked.append(((used >= switch_at, name == lead, index), spec))
+        # The native subagent exists only inside Claude Code: any other lead tries it last,
+        # where PIRLO_NATIVE just means "do it yourself".
+        native_elsewhere = spec["cli"] == "native" and lead != "claude"
+        ranked.append(((native_elsewhere, used >= switch_at, name == lead, index), spec))
     ranked.sort(key=lambda item: item[0])
     return [spec for _, spec in ranked], notes
 
@@ -407,7 +480,7 @@ def run_chain(config, mode, cwd, prompt):
             failed.append(f"{spec_name(spec)} failed: {(result['error'] or '')[:120]}")
         last = result
     save_state(state)
-    if os.environ.get("CLAUDECODE"):
+    if lead_brand() == "claude":
         return {"native": True, "ok": False, "spec": {"cli": "native"}, "notes": notes + failed,
                 "text": "", "usage": None, "seconds": 0.0, "error": None}
     last = last or {"text": "", "usage": None, "seconds": 0.0}
@@ -546,7 +619,7 @@ def detect_cli(cli, exe):
         if code == 0:
             entry["models"] = parse_model_list(out)
             entry["loggedIn"] = bool(entry["models"]) or None
-        elif re.search(r"log ?in|auth|unauthori[sz]ed|credential", out, re.IGNORECASE):
+        elif re.search(r"log ?in|sign ?in|auth|unauthori[sz]ed|credential", out, re.IGNORECASE):
             entry["loggedIn"] = False
     return entry
 
@@ -609,8 +682,12 @@ def propose(clis, leaders):
                 picks.append(spec)
     if not any(p["cli"] == "native" for p in picks) and "claude" in leaders:
         picks.append({"cli": "native"})
+    # Brands that never lead first, then the leads from the last in the leadership order to the
+    # first: the main lead's quota is the one most worth sparing.
     order = {name: n for n, name in enumerate(BUILTIN_CLIS)}
-    picks.sort(key=lambda spec: (brand(spec) in leaders, order.get(brand(spec), 9)))
+    picks.sort(key=lambda spec: (brand(spec) in leaders,
+                                 -leaders.index(brand(spec)) if brand(spec) in leaders else 0,
+                                 order.get(brand(spec), 9)))
     if not picks:
         notes.append("no usable worker CLI found")
     elif all(brand(p) in leaders for p in picks):
@@ -658,6 +735,7 @@ def build_command(config, spec, mode, cwd, prompt):
     model, effort = spec.get("model"), spec.get("effort")
     timeout = int(config["workerTimeoutSeconds"])
     if cli == "agy":
+        prompt += agy_shell_note()
         argv = [exe, "--output-format", "json", "--mode",
                 "accept-edits" if mode == "edit" else "plan",
                 "--print-timeout", f"{timeout}s", "--add-dir", str(cwd)]
@@ -707,6 +785,24 @@ def build_command(config, spec, mode, cwd, prompt):
     return argv, prompt if via_stdin else None, adapter.get("format", "text")
 
 
+def agy_settings_path():
+    return Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+
+
+def agy_shell_note():
+    """Tell agy which commands its settings allow, so it never tries one that is denied."""
+    data = read_json(agy_settings_path())
+    allow = ((data or {}).get("permissions") or {}).get("allow") if isinstance(data, dict) else None
+    allowed = [m.group(1) for rule in allow or [] if isinstance(rule, str)
+               for m in [re.fullmatch(r"command\(([^()/]{1,30})\)", rule)] if m]
+    if allowed:
+        return (f"- Shell: only commands starting with these are allowed: {', '.join(allowed)}. Any "
+                "other command is denied and ends your turn with no reply, so never try one; read "
+                "and search files with your file tools instead.\n")
+    return ("- You cannot run shell commands here: any command is denied and ends your turn with no "
+            "reply. Read and search files with your file tools.\n")
+
+
 def text_of(value):
     if isinstance(value, str):
         return value
@@ -745,7 +841,7 @@ def normalize_usage(raw):
         total = first_number(raw, ("input_tokens", "inputTokens", "prompt_tokens",
                                    "promptTokenCount", "input"))
         cached = first_number(raw, ("cached_input_tokens", "cachedInputTokens",
-                                    "cachedContentTokenCount", "cached")) or 0
+                                    "cachedContentTokenCount", "cache_read_tokens", "cached")) or 0
     if total is None and out is None:
         total = first_number(raw, ("total_tokens", "totalTokens", "totalTokenCount"))
         if total is None:
@@ -818,8 +914,14 @@ def parse_output(fmt, stdout):
         return stdout, None, None if stdout else "worker printed nothing"
     text = text_of(data).strip()
     error = None
-    if data.get("is_error") or (data.get("error") and not text):
+    if data.get("is_error") or str(data.get("status", "")).upper() in ("ERROR", "FAILED") or (
+            data.get("error") and not text):
         error = text_of(data.get("error")) or text or "worker reported an error"
+    elif not text and data.get("denied_actions"):
+        # agy in print mode reports the tools it was not allowed to use instead of failing.
+        names = [str(a.get("display_name") or a.get("action")) for a in data["denied_actions"]
+                 if isinstance(a, dict)]
+        error = f"worker was denied: {', '.join(names) or 'a tool'}"
     return text, find_usage(data), error
 
 
@@ -842,11 +944,15 @@ def run_worker(config, spec, mode, cwd, prompt):
         return {"ok": False, "error": str(error), "text": "", "usage": None,
                 "seconds": time.monotonic() - started}
     text, usage, error = parse_output(fmt, proc.stdout or "")
+    stderr = (proc.stderr or "").strip().splitlines()
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
-        error = f"worker exited with status {proc.returncode}: " + (" | ".join(tail) or error or "")
+        # The CLI's own error message beats the tail of stderr, which may be a list of models.
+        tail = " | ".join((stderr or (proc.stdout or "").strip().splitlines())[-3:])
+        error = f"worker exited with status {proc.returncode}: " + (
+            error if error and error != "worker printed nothing" else tail)
     if not text and not error:
-        error = "worker returned an empty reply"
+        # agy exits 0 with an empty reply on --print-timeout and says why on stderr.
+        error = "worker returned an empty reply" + (f": {stderr[-1][:200]}" if stderr else "")
     return {"ok": error is None, "error": error, "text": text, "usage": usage,
             "quota": claude_quota(proc.stdout or "") if spec["cli"] == "claude" else None,
             "seconds": time.monotonic() - started}
@@ -1036,7 +1142,7 @@ def cmd_digest(args):
     lines = output.count("\n") + (1 if output and not output.endswith("\n") else 0)
     head = (f"$ {label}\n" if label else "") + f"{lines} lines of output, saved in {log_ref}"
     try:
-        specs = worker_list(config) or ([{"cli": "native"}] if os.environ.get("CLAUDECODE") else [])
+        specs = worker_list(config) or ([{"cli": "native"}] if lead_brand() == "claude" else [])
     except PirloError:
         specs = []
     spec = specs[0] if specs else {"cli": "none"}
@@ -1121,7 +1227,10 @@ def cmd_detect(args):
 
 def cmd_propose(args):
     config, _, _ = load_config(repo_root(os.getcwd()))
-    proposal, notes = propose(detect(config), args.leader)
+    clis = detect(config)
+    if args.only:
+        clis = [c for c in clis if c["cli"] in args.leader.split(",")]
+    proposal, notes = propose(clis, args.leader)
     print(json.dumps({"config": proposal, "notes": notes}, indent=2))
     return 0
 
@@ -1165,6 +1274,7 @@ def cmd_show(args):
         chain, notes = [], [str(error)]
     print(json.dumps({
         "active": active, "source": source, "repo": str(root), "lead": lead_brand(),
+        "leadFoundBy": detect_lead()[1],
         "nextWorkers": [spec_name(spec) for spec in chain], "notes": notes,
         "quota": state.get("quota", {}), "resting": state.get("cooldown", {}),
         "userConfig": str(user_config_path()), "localConfig": str(local_dir(root) / "config.json"),
@@ -1307,6 +1417,11 @@ def newest_claude_transcript(root):
         folder = claude_projects() / re.sub(r"[^A-Za-z0-9]", "-", spelling)
         if folder.is_dir():
             files += folder.glob("*.jsonl")
+    # Claude Code names its own session in the environment: exact, even with two sessions open.
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    exact = [path for path in files if session and path.stem == session]
+    if exact:
+        return exact[0]
     files = sorted(set(files), key=lambda path: path.stat().st_mtime, reverse=True)
     for path in files[:10]:
         try:
@@ -1373,6 +1488,16 @@ def cut(text, limit):
     return text if len(text) <= limit else text[:limit].rstrip() + " [...]"
 
 
+def next_lead(config, lead):
+    """The lead after this one in the user's leadership order, as a name to show."""
+    leaders = [name for name in config.get("leaders") or [] if name != "other"]
+    if lead not in leaders:
+        return None
+    after = leaders[leaders.index(lead) + 1:] + leaders[:leaders.index(lead)]
+    labels = {name: label for name, label, _ in KNOWN_LEADS}
+    return labels.get(after[0], after[0]) if after else None
+
+
 def write_passe(root, lead, reason, transcript=None):
     asks, answer, edited = read_claude_transcript(transcript, root) if transcript else ([], "", [])
     status = run_quiet(["git", "-C", str(root), "status", "--short"])[1].strip()
@@ -1408,7 +1533,8 @@ def cmd_passe(args):
     lead = args.lead or lead_brand() or "the previous AI"
     transcript = args.transcript or (newest_claude_transcript(root) if lead == "claude" else None)
     written = write_passe(root, lead, args.reason or "handed over by the user", transcript)
-    print(f"passe ready: {os.path.relpath(written, os.getcwd())}. Open another AI here and say: continue")
+    following = next_lead(load_config(root)[0], lead) or "another AI"
+    print(f"passe ready: {os.path.relpath(written, os.getcwd())}. Open {following} here and say: continue")
     return 0
 
 
@@ -1439,8 +1565,9 @@ def cmd_hook_stop_failure(payload):
     save_state(state)
     path = write_passe(root, "claude", "it hit its usage limit", payload.get("transcript_path")
                        or newest_claude_transcript(root))
+    following = next_lead(config, "claude") or "another AI"
     notify(f"pirlo: Claude is out of quota. The handover is ready in {path}. "
-           "Open another AI in this folder and say: continue")
+           f"Open {following} in this folder and say: continue")
     return 0
 
 
@@ -1482,28 +1609,41 @@ def cmd_hook(args):
 
 
 def cmd_allow(args):
-    print(allow_rules())
+    print(allow_agy() if args.target == "agy" else allow_rules())
     return 0
+
+
+def add_rules(path, rules, key):
+    """Add rules to a JSON settings file under permissions.<key>. Returns the rules added."""
+    data = read_json(path) if path.exists() else {}
+    if not isinstance(data, dict):
+        raise PirloError(f"{path} is not plain JSON; add to permissions.{key} by hand: {', '.join(rules)}")
+    permissions = data.setdefault("permissions", {})
+    allow = permissions.setdefault(key, []) if isinstance(permissions, dict) else None
+    if not isinstance(allow, list):
+        raise PirloError(f"permissions.{key} in {path} is not a list; add by hand: {', '.join(rules)}")
+    added = [rule for rule in rules if rule not in allow]
+    if added:
+        allow.extend(added)
+        write_json(path, data)
+    return added
+
+
+def allow_agy():
+    """Let agy workers run read-only shell commands, such as git log, in --print mode."""
+    path = agy_settings_path()
+    added = add_rules(path, AGY_RULES, "allow")
+    return f"added to {path}: {', '.join(added)}" if added else \
+        f"{path} already allows the read-only commands"
 
 
 def allow_rules():
     """Let Claude Code run pirlo's read-only commands without a permission prompt."""
     base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     path = base / "settings.json"
-    data = read_json(path) if path.exists() else {}
-    rules = ", ".join(ALLOW_RULES)
-    if not isinstance(data, dict):
-        raise PirloError(f"{path} is not plain JSON; add to permissions.allow by hand: {rules}")
-    permissions = data.setdefault("permissions", {})
-    allow = permissions.setdefault("allow", []) if isinstance(permissions, dict) else None
-    if not isinstance(allow, list):
-        raise PirloError(f"permissions.allow in {path} is not a list; add by hand: {rules}")
-    added = [rule for rule in ALLOW_RULES if rule not in allow]
-    if not added:
-        return f"{path} already allows pirlo's read-only commands"
-    allow.extend(added)
-    write_json(path, data)
-    return f"added to {path}: {', '.join(added)}"
+    added = add_rules(path, ALLOW_RULES, "allow")
+    return f"added to {path}: {', '.join(added)}" if added else \
+        f"{path} already allows pirlo's read-only commands"
 
 
 def cmd_instructions(args):
@@ -1533,11 +1673,13 @@ TEXT = {
         "logged_out": "instalado, mas NÃO logado (faça login antes)", "installed": "instalado",
         "choose_one": "Escolha (número)", "choose_many": "Escolha (números separados por vírgula)",
         "invalid": "  Opção inválida.", "yes_no": "(s/n)", "yes": "s", "no": "n",
-        "leaders_q": "Em quais IAs você quer usar o pirlo como líder?",
-        "leaders_why": "O líder é a IA que você usa no dia a dia. O pirlo ensina essa IA a passar o "
-                       "trabalho braçal (rodar testes, build e lint, ler logs de CI, rastrear código "
-                       "em vários arquivos) para "
-                       "outra mais barata, sem você pedir.",
+        "leaders_q": "Quais IAs você quer usar, em ordem de liderança?",
+        "leaders_why": "A primeira é o líder: a IA que você usa no dia a dia. O pirlo ensina o líder "
+                       "a passar o trabalho braçal (rodar testes, build e lint, ler logs de CI, "
+                       "rastrear código em vários arquivos) para um worker, sem você pedir. Quando a "
+                       "cota do líder acaba, a seguinte da lista assume. Os workers são os modelos "
+                       "mais leves dessas mesmas IAs, e o pirlo usa primeiro os da IA que você "
+                       "menos usa como líder. Digite os números na ordem, por exemplo 2,1,3.",
         "other": "Outra IA não listada (usa AGENTS.md)",
         "missing": " (não instalado)",
         "scope_q": "Onde o pirlo deve ficar ativo?",
@@ -1547,18 +1689,12 @@ TEXT = {
         "no_repo": "Você não está num repositório git, então o pirlo fica ativo em todos (global). "
                    "Para usar só num projeto, rode `pirlo setup` dentro dele.",
         "note": "Obs.: {note}",
-        "worker_q": "Em que ordem o pirlo deve usar os workers?",
-        "worker_why": "O worker lê o material bruto e devolve só um resumo curto com arquivo:linha, "
-                      "em modo só leitura. Cada marca é uma assinatura com cota própria. O pirlo usa "
-                      "o primeiro da lista e troca sozinho para o próximo quando um fica sem cota, e "
-                      "deixa por último o da mesma marca do líder que está chamando, para poupar a "
-                      "cota dele. Digite a ordem, por exemplo 2,1,3, e deixe de fora o que não quiser.",
         "models_q": "Quer trocar o modelo de algum worker?",
         "model_q": "Modelo do {name}:",
         "native": "native: o subagente do Claude Code (Haiku) faz o trabalho, sem outra assinatura",
         "recommended": " (recomendado)",
-        "no_worker": "Nenhum worker disponível. Instale e faça login em outra IA (agy, codex...) e "
-                     "rode `pirlo setup` de novo.",
+        "no_worker": "Nenhum worker disponível. Escolha pelo menos uma IA entre Claude Code, Codex e "
+                     "Antigravity, logada, e rode `pirlo setup` de novo.",
         "allow_q": "Liberar no Claude Code os comandos de leitura do pirlo sem pedir aprovação?",
         "allow_why": "O Claude Code pede aprovação antes de rodar comandos. Os comandos do pirlo só "
                      "leem e pedem um resumo ao worker, então liberar é seguro. Os comandos do seu "
@@ -1570,7 +1706,13 @@ TEXT = {
                      "internet para falar com o worker, então sem a regra o Codex pediria aprovação "
                      "a cada delegação. A regra (~/.codex/rules/pirlo.rules) libera só os comandos "
                      "de leitura do pirlo; os comandos do seu projeto continuam no sandbox.",
-        "summary": "Resumo:", "s_leaders": "  Líderes: {v}", "s_scope": "  Escopo:  {v}",
+        "agy_q": "Liberar comandos de leitura (git log, git diff, cat, grep...) para o worker do "
+                 "Antigravity?",
+        "agy_why": "Rodando sem terminal, o Antigravity nega todo comando de shell, e uma negação "
+                   "deixa a resposta vazia. Isso libera só comandos que não alteram nada, para ele "
+                   "poder ler o histórico do git. Grava em ~/.gemini/antigravity-cli/settings.json.",
+        "s_agy": "  Comandos de leitura no worker do Antigravity: {v}",
+        "summary": "Resumo:", "s_leaders": "  Liderança: {v}", "s_scope": "  Escopo:  {v}",
         "s_global": "global", "s_local": "só em {root}", "s_worker": "  Workers: {v}",
         "s_allow": "  Liberar comandos de leitura no Claude Code: {v}",
         "s_rules": "  Regra do sandbox do Codex: {v}", "v_yes": "sim", "v_no": "não",
@@ -1602,11 +1744,13 @@ TEXT = {
         "logged_out": "installed but NOT logged in (log in first)", "installed": "installed",
         "choose_one": "Choose (number)", "choose_many": "Choose (numbers separated by commas)",
         "invalid": "  Invalid option.", "yes_no": "(y/n)", "yes": "y", "no": "n",
-        "leaders_q": "Which AIs do you want to use pirlo with as the lead?",
-        "leaders_why": "The lead is the AI you use every day. pirlo teaches it to hand bulky work "
-                       "(running tests, builds and linters, reading CI logs, tracing code across "
-                       "files) to a cheaper "
-                       "one, without you asking.",
+        "leaders_q": "Which AIs do you want to use, in leadership order?",
+        "leaders_why": "The first is the lead: the AI you use every day. pirlo teaches the lead to "
+                       "hand bulky work (running tests, builds and linters, reading CI logs, tracing "
+                       "code across files) to a worker, without you asking. When the lead runs out "
+                       "of quota, the next one in the list takes over. The workers are the lightest "
+                       "models of these same AIs, and pirlo first uses those of the AI you lead with "
+                       "least. Type the numbers in order, for example 2,1,3.",
         "other": "Another AI not listed (uses AGENTS.md)",
         "missing": " (not installed)",
         "scope_q": "Where should pirlo be on?",
@@ -1616,19 +1760,12 @@ TEXT = {
         "no_repo": "You are not in a git repository, so pirlo will be on everywhere (global). To "
                    "use it in one project only, run `pirlo setup` inside it.",
         "note": "Note: {note}",
-        "worker_q": "In what order should pirlo use the workers?",
-        "worker_why": "The worker reads the raw material and returns only a short summary with "
-                      "path:line, read-only. Each brand is a subscription with its own quota. pirlo "
-                      "uses the first in the list and moves on by itself when one runs out of "
-                      "quota, and leaves the one of the calling lead's brand for last, to spare "
-                      "the lead's quota. Type the order, for example 2,1,3, and leave out what you "
-                      "do not want.",
         "models_q": "Do you want to change the model of a worker?",
         "model_q": "Model for {name}:",
         "native": "native: the Claude Code subagent (Haiku) does the work, no other subscription",
         "recommended": " (recommended)",
-        "no_worker": "No worker available. Install and log in to another AI (agy, codex...) and "
-                     "run `pirlo setup` again.",
+        "no_worker": "No worker available. Choose at least one logged-in AI among Claude Code, Codex "
+                     "and Antigravity, and run `pirlo setup` again.",
         "allow_q": "Let Claude Code run pirlo's read-only commands without asking?",
         "allow_why": "Claude Code asks before running commands. pirlo's commands only read and ask "
                      "the worker for a summary, so allowing them is safe. Your project's commands, "
@@ -1639,7 +1776,13 @@ TEXT = {
                      "reach the worker, so without the rule Codex would ask on every delegation. "
                      "The rule (~/.codex/rules/pirlo.rules) allows only pirlo's read-only "
                      "commands; your project's commands stay in the sandbox.",
-        "summary": "Summary:", "s_leaders": "  Leads:  {v}", "s_scope": "  Scope:  {v}",
+        "agy_q": "Allow read-only commands (git log, git diff, cat, grep...) for the Antigravity "
+                 "worker?",
+        "agy_why": "Running without a terminal, Antigravity denies every shell command, and one "
+                   "denial leaves the reply empty. This allows only commands that change nothing, "
+                   "so it can read the git history. Writes to ~/.gemini/antigravity-cli/settings.json.",
+        "s_agy": "  Read-only commands for the Antigravity worker: {v}",
+        "summary": "Summary:", "s_leaders": "  Leadership: {v}", "s_scope": "  Scope:  {v}",
         "s_global": "global", "s_local": "only in {root}", "s_worker": "  Workers: {v}",
         "s_allow": "  Allow read-only commands in Claude Code: {v}",
         "s_rules": "  Codex sandbox rule: {v}", "v_yes": "yes", "v_no": "no",
@@ -1869,7 +2012,7 @@ def cmd_setup(args):
 
     leads = [(name, label, file) for name, label, file in found]
     leads.append(("other", talk.t("other"), "AGENTS.md"))
-    default = [n for n, (name, _, _) in enumerate(leads, 1) if name in ("claude", "codex")] or [1]
+    default = [n for n, (name, _, _) in enumerate(leads, 1) if name in BUILTIN_CLIS] or [1]
     picked = talk.choose(talk.t("leaders_q"), [label for _, label, _ in leads], default, multi=True,
                          why=talk.t("leaders_why"))
     chosen = [leads[i] for i in picked]
@@ -1884,18 +2027,17 @@ def cmd_setup(args):
         talk.say("no_repo")
         scope = "user"
 
-    proposal, notes = propose(clis, [n for n in names if n != "other"])
+    # Workers come from the chosen AIs only: the lightest model of each, in propose's order.
+    proposal, notes = propose([c for c in clis if c["cli"] in names], [n for n in names if n != "other"])
     for note in notes:
-        print()
-        talk.say("note", note=note)
-    options = proposal["workers"]
-    if not options:
+        if "shares a subscription" not in note:
+            print()
+            talk.say("note", note=note)
+    workers = proposal["workers"]
+    if not workers:
         print()
         talk.say("no_worker")
         return 1
-    order = talk.choose(talk.t("worker_q"), [spec_label(spec, talk) for spec in options],
-                        list(range(1, len(options) + 1)), multi=True, why=talk.t("worker_why"))
-    workers = [options[i] for i in order]
     if any(by_name.get(w["cli"], {}).get("models") for w in workers) and \
             talk.confirm(f"\n{talk.t('models_q')}", False):
         for n, spec in enumerate(workers):
@@ -1908,17 +2050,21 @@ def cmd_setup(args):
 
     allow = "claude" in names and talk.confirm(talk.t("allow_q"), True, why=talk.t("allow_why"))
     rules = "codex" in names and talk.confirm(talk.t("rules_q"), True, why=talk.t("rules_why"))
+    agy = any(w["cli"] == "agy" for w in workers) and \
+        talk.confirm(talk.t("agy_q"), True, why=talk.t("agy_why"))
 
     yes_no = lambda value: talk.t("v_yes" if value else "v_no")
     print()
     talk.say("summary")
-    talk.say("s_leaders", v=", ".join(label for _, label, _ in chosen))
+    talk.say("s_leaders", v=" → ".join(label for _, label, _ in chosen))
     talk.say("s_scope", v=talk.t("s_global") if scope == "user" else talk.t("s_local", root=root))
     talk.say("s_worker", v=" → ".join(spec_label(spec, talk).split(":")[0] for spec in workers))
     if "claude" in names:
         talk.say("s_allow", v=yes_no(allow))
     if "codex" in names:
         talk.say("s_rules", v=yes_no(rules))
+    if any(w["cli"] == "agy" for w in workers):
+        talk.say("s_agy", v=yes_no(agy))
     if not talk.confirm(f"\n{talk.t('apply_q')}", True):
         talk.say("nothing")
         return 1
@@ -1938,6 +2084,12 @@ def cmd_setup(args):
     if "codex" in names:
         print("\nCodex:")
         install_codex(talk, rules)
+    if agy:
+        print("\nAntigravity:")
+        try:
+            print("  " + allow_agy())
+        except PirloError as error:
+            print(f"  {error}")
     files = list(dict.fromkeys(file for name, _, file in chosen if file))
     if files:
         print(f"\n{talk.t('other_heading')}")
@@ -1971,7 +2123,9 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_detect)
     p = sub.add_parser("propose", help="propose a worker from what is installed")
-    p.add_argument("--leader", default="claude", help="the CLIs you lead from, comma-separated: claude,codex,agy...")
+    p.add_argument("--leader", default="claude", help="the AIs you use, in leadership order, "
+                                                       "comma-separated: claude,codex,agy...")
+    p.add_argument("--only", action="store_true", help="workers only from those AIs")
     p.set_defaults(func=cmd_propose)
     p = sub.add_parser("setup", help="interactive setup in the terminal")
     p.set_defaults(func=cmd_setup)
@@ -1996,7 +2150,9 @@ def main(argv=None):
     p.add_argument("--cwd")
     p.add_argument("--done", action="store_true", help="close the passe after taking the work over")
     p.set_defaults(func=cmd_passe)
-    p = sub.add_parser("allow", help="let Claude Code run pirlo's read-only commands unprompted")
+    p = sub.add_parser("allow", help="allow read-only commands: pirlo's in Claude Code, or git log "
+                                     "and the like for agy workers")
+    p.add_argument("target", nargs="?", choices=("claude", "agy"), default="claude")
     p.set_defaults(func=cmd_allow)
     p = sub.add_parser("instructions", help="print the lead instructions for AGENTS.md")
     p.set_defaults(func=cmd_instructions)
