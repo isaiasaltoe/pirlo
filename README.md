@@ -12,6 +12,9 @@ O nome é uma homenagem ao Andrea Pirlo, o regista que recebia a bola, decidia e
 
 Linux, WSL ou macOS, com Python 3.9 ou mais novo. Na pasta do projeto:
 
+> **Testado de verdade até agora:** Claude Code e Antigravity, como líder e como worker. O Codex já é suportado, mas ainda não foi testado com uma conta real.
+
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/isaiasaltoe/pirlo/main/install.sh | sh
 ```
