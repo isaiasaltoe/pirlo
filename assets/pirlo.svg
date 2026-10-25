@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-labelledby="title">
+  <title id="title">pirlo: a ball in the center circle passing to three players</title>
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#ffffff"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="192" height="192" rx="36" fill="#1d4ea0"/>
+  <g fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="3">
+    <line x1="4" y1="100" x2="196" y2="100"/>
+    <circle cx="100" cy="100" r="38"/>
+  </g>
+  <g fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 9" marker-end="url(#head)">
+    <path d="M90 88 C 75 60, 60 50, 46 46"/>
+    <path d="M112 90 C 130 62, 145 56, 156 54"/>
+    <path d="M108 113 C 122 140, 135 148, 148 152"/>
+  </g>
+  <circle cx="38" cy="42" r="12" fill="#f5a524"/>
+  <circle cx="164" cy="50" r="12" fill="#34c27a"/>
+  <circle cx="156" cy="158" r="12" fill="#e45b5b"/>
+  <circle cx="100" cy="100" r="15" fill="#ffffff"/>
+  <path d="M100 92 L107 97 L104.5 105 L95.5 105 L93 97 Z" fill="#1d4ea0"/>
+  <text x="34" y="168" font-family="Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#ffffff" fill-opacity="0.9">21</text>
+</svg>

@@ -22,13 +22,15 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 BUILTIN_CLIS = ("agy", "codex", "claude")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULTS = {
-    "version": 2,
-    "worker": None,
+    "version": 3,
+    "workers": None,
     "workerTimeoutSeconds": 600,
+    "switchAt": 90,
+    "cooldownMinutes": 60,
     "maxReplyWords": 200,
     "maxReplyChars": 6000,
     "inlineOutputChars": 2500,
@@ -150,36 +152,262 @@ def load_config(root):
     return config, source, active
 
 
-def worker_spec(config):
-    spec = config.get("worker")
-    if isinstance(spec, str):
-        spec = {"cli": spec}
-    if isinstance(spec, dict) and spec.get("cli"):
-        return spec
-    # Nothing configured: inside Claude Code the subagent itself is the worker.
-    if os.environ.get("CLAUDECODE"):
-        return {"cli": "native"}
-    raise PirloError("no worker is configured; run the pirlo setup (/pirlo:setup in Claude Code)")
+def worker_list(config):
+    """The workers in the user's order. Accepts the older single "worker" key."""
+    raw = config.get("workers")
+    if raw is None and config.get("worker") is not None:
+        raw = [config["worker"]]
+    specs = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, str):
+            item = {"cli": item}
+        if isinstance(item, dict) and item.get("cli"):
+            specs.append(item)
+    return specs
 
 
 def validate_config(data):
     if not isinstance(data, dict):
         raise PirloError("config must be a JSON object")
     adapters = data.get("adapters", {})
-    spec = data.get("worker")
-    if isinstance(spec, str):
-        spec = {"cli": spec}
-    if not isinstance(spec, dict) or not spec.get("cli"):
-        raise PirloError('the config needs a worker, like {"worker": {"cli": "agy", "model": "..."}}')
-    cli = spec["cli"]
-    if cli not in BUILTIN_CLIS + ("native",) and cli not in adapters:
-        raise PirloError(f"unknown worker cli '{cli}' (add it under adapters)")
-    if spec.get("effort") and spec["effort"] not in EFFORTS:
-        raise PirloError(f"effort must be one of {', '.join(EFFORTS)}")
+    specs = worker_list(data)
+    if not specs:
+        raise PirloError('the config needs workers, like {"workers": [{"cli": "agy", "model": "..."}]}')
+    for spec in specs:
+        cli = spec["cli"]
+        if cli not in BUILTIN_CLIS + ("native",) and cli not in adapters:
+            raise PirloError(f"unknown worker cli '{cli}' (add it under adapters)")
+        if spec.get("effort") and spec["effort"] not in EFFORTS:
+            raise PirloError(f"effort must be one of {', '.join(EFFORTS)}")
     for name, adapter in adapters.items():
         if not isinstance(adapter, dict) or not isinstance(adapter.get("command"), list):
             raise PirloError(f"adapter '{name}' needs a command list")
     return data
+
+
+# ---------------------------------------------------------------- quota and switching
+# Each brand is one subscription: what a worker spends comes out of its CLI's quota,
+# whatever model it runs. pirlo prefers brands other than the lead's and moves on by
+# itself when one is low or out.
+
+RATE_LIMIT = re.compile(r"\b429\b|rate.?limit|usage limit|quota|too many requests|"
+                        r"hit your (?:\w+ )?limit|resource.?exhausted|limit reached", re.IGNORECASE)
+CLAUDE_WINDOWS = {"five_hour": "5h", "seven_day": "week"}
+CODEX_WINDOWS = {300: "5h", 10080: "week"}
+CODEX_TAIL_BYTES = 256 * 1024
+
+
+def brand(spec):
+    return "claude" if spec["cli"] == "native" else spec["cli"]
+
+
+def spec_name(spec):
+    return " ".join(x for x in (spec.get("cli"), spec.get("model"), spec.get("effort")) if x)
+
+
+def lead_brand():
+    """The CLI pirlo was called from, when it says so in the environment."""
+    if os.environ.get("PIRLO_LEAD"):
+        return os.environ["PIRLO_LEAD"]
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    if any(os.environ.get(key) for key in ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX",
+                                           "CODEX_SANDBOX_NETWORK_DISABLED")):
+        return "codex"
+    return None
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def stamp(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    return None
+
+
+def clock(value):
+    when = stamp(value)
+    return when.astimezone().strftime("%H:%M") if when else "?"
+
+
+def state_path():
+    return pirlo_home() / "state.json"
+
+
+def load_state():
+    data = read_json(state_path())
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(state):
+    try:
+        write_json(state_path(), state)
+    except OSError:
+        pass
+
+
+def window(percent, reset):
+    when = stamp(reset)
+    if not isinstance(percent, (int, float)) or when is None:
+        return None
+    return {"usedPercent": round(float(percent), 1), "resetsAt": when.isoformat()}
+
+
+def claude_quota(stdout):
+    """Quota windows from the rate_limit_event that claude -p prints in stream-json."""
+    reading = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
+            continue
+        info = event.get("rate_limit_info") or {}
+        windows = {}
+        for key, name in CLAUDE_WINDOWS.items():
+            raw = (info.get("unifiedWindows") or {}).get(key)
+            if isinstance(raw, dict) and isinstance(raw.get("utilization"), (int, float)):
+                found = window(raw["utilization"] * 100, raw.get("resetsAt"))
+                if found:
+                    windows[name] = found
+        if windows:
+            reading = {"windows": windows, "observedAt": utcnow().isoformat()}
+    return reading
+
+
+def codex_quota():
+    """Quota windows from the newest Codex session file, as Codex itself records them."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        files = list((home / "sessions").glob("*/*/*/rollout-*.jsonl"))
+        if not files:
+            return None
+        newest = max(files, key=lambda path: path.stat().st_mtime)
+        with newest.open("rb") as handle:
+            size = newest.stat().st_size
+            handle.seek(max(0, size - CODEX_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        payload = event.get("payload") if isinstance(event, dict) else None
+        limits = (payload if isinstance(payload, dict) else event if isinstance(event, dict) else {}).get("rate_limits")
+        if not isinstance(limits, dict):
+            continue
+        windows = {}
+        for key in ("primary", "secondary"):
+            raw = limits.get(key)
+            if isinstance(raw, dict) and raw.get("window_minutes") in CODEX_WINDOWS:
+                found = window(raw.get("used_percent"), raw.get("resets_at"))
+                if found:
+                    windows[CODEX_WINDOWS[raw["window_minutes"]]] = found
+        if windows:
+            return {"windows": windows, "observedAt": utcnow().isoformat(), "source": str(newest)}
+    return None
+
+
+def used_percent(reading, now):
+    """The fullest window that has not reset yet."""
+    if not isinstance(reading, dict):
+        return 0.0
+    used = [w["usedPercent"] for w in (reading.get("windows") or {}).values()
+            if isinstance(w, dict) and (stamp(w.get("resetsAt")) or now) > now]
+    return max(used, default=0.0)
+
+
+def reading_for(name, state):
+    if name == "codex":
+        fresh = codex_quota()
+        if fresh:
+            state.setdefault("quota", {})["codex"] = fresh
+            return fresh
+    return (state.get("quota") or {}).get(name)
+
+
+def worker_chain(config, state):
+    """Workers to try, in order: brands other than the lead's first, low quota last,
+    resting brands left out. Returns (chain, notes)."""
+    specs = worker_list(config)
+    if not specs:
+        if os.environ.get("CLAUDECODE"):
+            return [{"cli": "native"}], []
+        raise PirloError("no worker is configured; run `pirlo setup`")
+    now, lead = utcnow(), lead_brand()
+    switch_at = float(config.get("switchAt", 90))
+    ranked, notes = [], []
+    for index, spec in enumerate(specs):
+        name = brand(spec)
+        until = stamp((state.get("cooldown") or {}).get(name))
+        if until and until > now:
+            notes.append(f"{name} skipped: out of quota until {clock(until)}")
+            continue
+        used = used_percent(reading_for(name, state), now)
+        if used >= switch_at:
+            notes.append(f"{name} last: {used:g}% of its quota used")
+        ranked.append(((used >= switch_at, name == lead, index), spec))
+    ranked.sort(key=lambda item: item[0])
+    return [spec for _, spec in ranked], notes
+
+
+def rest(state, spec, config, reading):
+    """Leave a brand out until its quota resets, or for cooldownMinutes."""
+    now = utcnow()
+    resets = [stamp(w.get("resetsAt")) for w in ((reading or {}).get("windows") or {}).values()
+              if isinstance(w, dict) and w.get("usedPercent", 0) >= 99]
+    resets = [when for when in resets if when and when > now]
+    until = max(resets) if resets else now + dt.timedelta(minutes=float(config.get("cooldownMinutes", 60)))
+    state.setdefault("cooldown", {})[brand(spec)] = until.isoformat()
+    return until
+
+
+def run_chain(config, mode, cwd, prompt):
+    """Try each worker in the chain until one answers. A worker that hits its quota
+    rests, and the next brand takes the task in the same call."""
+    state = load_state()
+    chain, notes = worker_chain(config, state)
+    failed, last = [], None
+    for spec in chain:
+        if spec["cli"] == "native":
+            save_state(state)
+            return {"native": True, "ok": False, "spec": spec, "notes": notes + failed,
+                    "text": "", "usage": None, "seconds": 0.0, "error": None}
+        try:
+            result = run_worker(config, spec, mode, cwd, prompt)
+        except PirloError as error:
+            result = {"ok": False, "error": str(error), "text": "", "usage": None, "seconds": 0.0}
+        if result.get("quota"):
+            state.setdefault("quota", {})[brand(spec)] = result["quota"]
+        if result["ok"]:
+            save_state(state)
+            result.update(spec=spec, notes=notes + failed, native=False)
+            return result
+        if RATE_LIMIT.search(result["error"] or ""):
+            until = rest(state, spec, config, result.get("quota") or reading_for(brand(spec), state))
+            failed.append(f"{spec_name(spec)} out of quota (resting until {clock(until)})")
+        else:
+            failed.append(f"{spec_name(spec)} failed: {(result['error'] or '')[:120]}")
+        last = result
+    save_state(state)
+    if os.environ.get("CLAUDECODE"):
+        return {"native": True, "ok": False, "spec": {"cli": "native"}, "notes": notes + failed,
+                "text": "", "usage": None, "seconds": 0.0, "error": None}
+    last = last or {"text": "", "usage": None, "seconds": 0.0}
+    last.update(ok=False, native=False, spec=chain[-1] if chain else {"cli": "none"},
+                notes=notes + failed, error="; ".join(failed) or "; ".join(notes) or "no worker available")
+    return last
 
 
 # ---------------------------------------------------------------- restrictions
@@ -356,27 +584,32 @@ def suggest(entry):
     return {"cli": cli, "model": pick(models, cli, 0, ("medium", "low", "high", None), (1,))}
 
 
-def propose(clis, leader):
-    """Prefer a worker on another subscription than the lead's, so the lead's quota is spared."""
+def propose(clis, leaders):
+    """One worker per brand, brands other than the leads' first, so the leads' quota is
+    spared and pirlo has somewhere to go when a brand runs out."""
+    if isinstance(leaders, str):
+        leaders = [name for name in leaders.split(",") if name]
     usable = [c for c in clis if c["installed"] and c["loggedIn"] is not False and not c.get("custom")]
     notes = [f"{c['cli']} is installed but not logged in: log in first"
              for c in clis if c["installed"] and c["loggedIn"] is False]
-    others = [c for name in BUILTIN_CLIS if name != leader for c in usable if c["cli"] == name]
-    # Claude Code leads get the native subagent instead of claude -p, which is far cheaper.
-    same = [c for c in usable if c["cli"] == leader and leader != "claude"]
-    worker = None
-    for entry in others + same:
-        worker = suggest(entry)
-        if worker:
-            break
-    if worker is None and leader == "claude":
-        worker = {"cli": "native"}
-        notes.append("no other logged-in CLI: the Claude Code subagent (haiku) does the work itself")
-    elif worker is None:
+    picks = []
+    for entry in usable:
+        if entry["cli"] == "claude" and "claude" in leaders:
+            # Claude Code leads get the native subagent instead of claude -p, which is far cheaper.
+            picks.append({"cli": "native"})
+        else:
+            spec = suggest(entry)
+            if spec:
+                picks.append(spec)
+    if not any(p["cli"] == "native" for p in picks) and "claude" in leaders:
+        picks.append({"cli": "native"})
+    order = {name: n for n, name in enumerate(BUILTIN_CLIS)}
+    picks.sort(key=lambda spec: (brand(spec) in leaders, order.get(brand(spec), 9)))
+    if not picks:
         notes.append("no usable worker CLI found")
-    elif worker["cli"] == leader:
-        notes.append(f"the worker uses the lead's own subscription ({leader}), with a cheaper model")
-    return {"version": 2, "leader": leader, "worker": worker}, notes
+    elif all(brand(p) in leaders for p in picks):
+        notes.append("every worker shares a subscription with a lead; they still use cheaper models")
+    return {"version": 3, "leaders": leaders, "workers": picks}, notes
 
 
 # ---------------------------------------------------------------- worker prompt
@@ -432,7 +665,7 @@ def build_command(config, spec, mode, cwd, prompt):
     if cli == "codex":
         argv = [exe, "exec", "--json", "--disable", "multi_agent",
                 "--sandbox", "workspace-write" if mode == "edit" else "read-only",
-                "--cd", str(cwd), "--skip-git-repo-check", "--ephemeral",
+                "--cd", str(cwd), "--skip-git-repo-check",
                 "-c", "mcp_servers={}"]
         if model:
             argv += ["--model", model]
@@ -441,14 +674,14 @@ def build_command(config, spec, mode, cwd, prompt):
         argv.append("-")
         return argv, prompt, "jsonl"
     if cli == "claude":
-        argv = [exe, "-p", "--output-format", "json", "--permission-mode",
+        argv = [exe, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode",
                 "acceptEdits" if mode == "edit" else "plan",
                 "--strict-mcp-config", "--disallowedTools", "Agent"]
         if model:
             argv += ["--model", model]
         if effort:
             argv += ["--effort", effort]
-        return argv, prompt, "json"
+        return argv, prompt, "jsonl"
     adapter = config["adapters"][cli]
     template = adapter.get("editCommand") if mode == "edit" else adapter["command"]
     if not template:
@@ -540,10 +773,16 @@ def parse_output(fmt, stdout):
             item = event.get("item") if isinstance(event.get("item"), dict) else {}
             if item.get("type") in ("agent_message", "assistant_message") and item.get("text"):
                 text = item["text"]
+            elif kind == "result":
+                text = text_of(event.get("result")) or text
+                if event.get("is_error"):
+                    error = text or "worker reported an error"
             elif kind in ("turn.failed", "error"):
                 error = text_of(event.get("error")) or text_of(event) or "worker reported an error"
             found = find_usage(event)
-            if found and kind == "turn.completed":
+            if found and kind == "result":
+                usage = found
+            elif found and kind == "turn.completed":
                 usage = {k: (usage or {}).get(k, 0) + v for k, v in found.items()}
             elif found and usage is None:
                 usage = found
@@ -556,7 +795,7 @@ def parse_output(fmt, stdout):
                     continue
                 if text:
                     break
-        return text.strip(), usage, None if text else error
+        return text.strip(), usage, error if error else (None if text else "worker printed nothing")
     data = None
     try:
         data = json.loads(stdout)
@@ -601,6 +840,7 @@ def run_worker(config, spec, mode, cwd, prompt):
     if not text and not error:
         error = "worker returned an empty reply"
     return {"ok": error is None, "error": error, "text": text, "usage": usage,
+            "quota": claude_quota(proc.stdout or "") if spec["cli"] == "claude" else None,
             "seconds": time.monotonic() - started}
 
 
@@ -683,9 +923,9 @@ def base_entry(kind, spec, root, restricted, mode):
     }
 
 
-def footer(spec, seconds):
-    who = " ".join(x for x in (spec.get("cli"), spec.get("model"), spec.get("effort")) if x)
-    return f"[pirlo: {who}, {seconds:.1f}s]"
+def footer(spec, seconds, notes=()):
+    extra = "".join(f"; {note}" for note in notes)
+    return f"[pirlo: {spec_name(spec)}, {seconds:.1f}s{extra}]"
 
 
 def prepare(args):
@@ -720,22 +960,24 @@ def cmd_ask(args, mode="read"):
         mode = "read"
         notice = (f"PIRLO_RESTRICTED: {', '.join(restricted)} is active, so workers stay "
                   "read-only. Describe the change; do not make it.\n")
-    spec = worker_spec(config)
-    if spec["cli"] == "native":
-        print(notice + "PIRLO_NATIVE: no external worker is configured. Do the task yourself with "
+    prompt = contract(mode, config["maxReplyWords"], restricted) + \
+        f"\n\nTask (working directory: {cwd}):\n{task}\n"
+    before = snapshot(root)
+    result = run_chain(config, mode, cwd, prompt)
+    spec = result["spec"]
+    if result["native"]:
+        why = "; ".join(result["notes"]) or "no external worker is configured"
+        print(notice + f"PIRLO_NATIVE ({why}): do the task yourself with "
               "Read, Grep, Glob and read-only Bash, and reply under the same rules: short, "
               "path:line references, no dumps." + (" Never solve exercises or give fixes: "
               "the user is a student." if restricted else ""))
         return 0
-    prompt = contract(mode, config["maxReplyWords"], restricted) + \
-        f"\n\nTask (working directory: {cwd}):\n{task}\n"
-    before = snapshot(root)
-    result = run_worker(config, spec, mode, cwd, prompt)
     touched = changed_files(before, snapshot(root))
     entry = base_entry("edit" if mode == "edit" else "ask", spec, root, restricted, mode)
     entry.update({"durationMs": int(result["seconds"] * 1000), "promptChars": len(prompt),
                   "taskChars": len(task), "replyChars": len(result["text"]), "ok": result["ok"],
-                  "usage": result["usage"], "filesChanged": len(touched)})
+                  "usage": result["usage"], "filesChanged": len(touched),
+                  "notes": result["notes"]})
     if not result["ok"]:
         entry["error"] = result["error"][:300]
         entry["returnedChars"] = 0
@@ -747,7 +989,7 @@ def cmd_ask(args, mode="read"):
         label = "Files changed" if mode == "edit" else \
             "WARNING: the worker changed files although it was read-only"
         reply += f"\n{label}: {', '.join(touched[:20])} (review with git diff)"
-    reply = notice + reply + "\n" + footer(spec, result["seconds"])
+    reply = notice + reply + "\n" + footer(spec, result["seconds"], result["notes"])
     entry["returnedChars"] = len(reply)
     append_log(config, entry)
     print(reply)
@@ -786,9 +1028,10 @@ def cmd_digest(args):
     lines = output.count("\n") + (1 if output and not output.endswith("\n") else 0)
     head = (f"$ {label}\n" if label else "") + f"{lines} lines of output, saved in {log_ref}"
     try:
-        spec = worker_spec(config)
+        specs = worker_list(config) or ([{"cli": "native"}] if os.environ.get("CLAUDECODE") else [])
     except PirloError:
-        spec = {"cli": "none"}
+        specs = []
+    spec = specs[0] if specs else {"cli": "none"}
     entry = base_entry("digest", spec, root, restricted, "read")
     entry.update({"outputChars": len(output), "taskChars": len(read_task(args, stdin=False))})
 
@@ -801,15 +1044,21 @@ def cmd_digest(args):
         return 0
 
     digest = excerpt(output, log_ref)
-    if spec["cli"] in ("native", "none"):
+
+    def free_digest(cli, notes=()):
         reply = f"{head}\n{digest}"
-        if spec["cli"] == "native":
+        if cli == "native":
             reply += f"\nPIRLO_NATIVE: read more of {log_ref} only if this is not enough."
-        entry.update({"cli": spec["cli"], "ok": True, "replyChars": len(reply),
-                      "returnedChars": len(reply), "durationMs": 0})
+        if notes:
+            reply += f"\n[pirlo: {'; '.join(notes)}]"
+        entry.update({"cli": cli, "model": None, "effort": None, "ok": True, "notes": list(notes),
+                      "replyChars": len(reply), "returnedChars": len(reply), "durationMs": 0})
         append_log(config, entry)
         print(reply)
         return 0
+
+    if spec["cli"] in ("native", "none") and len(specs) <= 1:
+        return free_digest(spec["cli"])
 
     focus = read_task(args, stdin=False) or (
         "Did it pass? For each failure or error: path:line, the message in one line, and the "
@@ -823,13 +1072,17 @@ def cmd_digest(args):
     prompt = (contract("read", config["maxReplyWords"], restricted) +
               f"\n\n{what} ran in {cwd}. {material}\n\n"
               f"Task: {focus}\nWhen you cite the output, cite it as {log_ref}:<line>.\n")
-    result = run_worker(config, spec, "read", cwd, prompt)
-    entry.update({"durationMs": int((time.monotonic() - started) * 1000), "promptChars": len(prompt),
+    result = run_chain(config, "read", cwd, prompt)
+    spec = result["spec"]
+    if result["native"]:
+        return free_digest("native", result["notes"])
+    entry.update({"cli": spec.get("cli"), "model": spec.get("model"), "effort": spec.get("effort"),
+                  "durationMs": int((time.monotonic() - started) * 1000), "promptChars": len(prompt),
                   "replyChars": len(result["text"]), "ok": result["ok"],
-                  "usage": result["usage"]})
+                  "usage": result["usage"], "notes": result["notes"]})
     if result["ok"]:
         reply = f"{head}\n{limit_reply(result['text'], int(config['maxReplyChars']))}\n" + \
-            footer(spec, result["seconds"])
+            footer(spec, result["seconds"], result["notes"])
     else:
         entry["error"] = (result["error"] or "")[:300]
         reply = f"{head}\n[pirlo: worker failed ({(result['error'] or '')[:200]}); free excerpt below]\n{digest}"
@@ -852,6 +1105,9 @@ def cmd_detect(args):
         print(f"{c['cli']:8} {state:14} {c['version'] or ''}")
         if models:
             print(f"         models: {models}")
+    leads = [label for name, label, _ in detect_leads() if name not in BUILTIN_CLIS]
+    if leads:
+        print(f"other agent CLIs (can lead): {', '.join(leads)}")
     return 0
 
 
@@ -894,8 +1150,15 @@ def cmd_show(args):
     root = repo_root(os.getcwd())
     config, source, active = load_config(root)
     found = restrictions(root, config.get("restrictivePlugins") or [])
+    state = load_state()
+    try:
+        chain, notes = worker_chain(config, state)
+    except PirloError as error:
+        chain, notes = [], [str(error)]
     print(json.dumps({
-        "active": active, "source": source, "repo": str(root),
+        "active": active, "source": source, "repo": str(root), "lead": lead_brand(),
+        "nextWorkers": [spec_name(spec) for spec in chain], "notes": notes,
+        "quota": state.get("quota", {}), "resting": state.get("cooldown", {}),
         "userConfig": str(user_config_path()), "localConfig": str(local_dir(root) / "config.json"),
         "log": str(log_path()), "readOnlyBecause": found, "config": config,
     }, indent=2, ensure_ascii=False))
@@ -1092,7 +1355,7 @@ TEXT = {
         "leaders_why": "O líder é a IA que você usa no dia a dia. O pirlo ensina essa IA a passar o "
                        "trabalho braçal (rodar testes, ler logs, docs e PDFs, buscas amplas) para "
                        "outra mais barata, sem você pedir.",
-        "other": "Outra IA (Antigravity, Kimi, Copilot, opencode...)",
+        "other": "Outra IA não listada (usa AGENTS.md)",
         "missing": " (não instalado)",
         "scope_q": "Onde o pirlo deve ficar ativo?",
         "scope_why": "Global vale para todos os seus repositórios. Local vale só para este, e os "
@@ -1101,10 +1364,14 @@ TEXT = {
         "no_repo": "Você não está num repositório git, então o pirlo fica ativo em todos (global). "
                    "Para usar só num projeto, rode `pirlo setup` dentro dele.",
         "note": "Obs.: {note}",
-        "worker_q": "Qual IA faz o trabalho braçal (o worker)?",
-        "worker_why": "O worker lê o material bruto e devolve só um resumo curto com arquivo:linha. "
-                      "Uma assinatura diferente da do líder poupa a cota dele. Ele roda em modo só "
-                      "leitura.",
+        "worker_q": "Em que ordem o pirlo deve usar os workers?",
+        "worker_why": "O worker lê o material bruto e devolve só um resumo curto com arquivo:linha, "
+                      "em modo só leitura. Cada marca é uma assinatura com cota própria. O pirlo usa "
+                      "o primeiro da lista e troca sozinho para o próximo quando um fica sem cota, e "
+                      "deixa por último o da mesma marca do líder que está chamando, para poupar a "
+                      "cota dele. Digite a ordem, por exemplo 2,1,3, e deixe de fora o que não quiser.",
+        "models_q": "Quer trocar o modelo de algum worker?",
+        "model_q": "Modelo do {name}:",
         "native": "native: o subagente do Claude Code (Haiku) faz o trabalho, sem outra assinatura",
         "recommended": " (recomendado)",
         "no_worker": "Nenhum worker disponível. Instale e faça login em outra IA (agy, codex...) e "
@@ -1121,23 +1388,23 @@ TEXT = {
                      "a cada delegação. A regra (~/.codex/rules/pirlo.rules) libera só os comandos "
                      "de leitura do pirlo; os comandos do seu projeto continuam no sandbox.",
         "summary": "Resumo:", "s_leaders": "  Líderes: {v}", "s_scope": "  Escopo:  {v}",
-        "s_global": "global", "s_local": "só em {root}", "s_worker": "  Worker:  {v}",
+        "s_global": "global", "s_local": "só em {root}", "s_worker": "  Workers: {v}",
         "s_allow": "  Liberar comandos de leitura no Claude Code: {v}",
         "s_rules": "  Regra do sandbox do Codex: {v}", "v_yes": "sim", "v_no": "não",
         "apply_q": "Aplicar?", "nothing": "Nada foi alterado.",
         "saved": "Configuração salva em {path}.",
-        "names": {"claude": "Claude Code", "codex": "Codex", "other": "outra IA"},
+        "other_heading": "Outras IAs:",
         "failed": "    não deu certo: {tail}",
         "skip": "  {name} não encontrado; pulando.",
         "plugin_ok": "  Plugin instalado no {name}.",
         "rules_ok": "  Regra do sandbox gravada em {path}.",
         "skills_ok": "  Skills instaladas em {path}.",
-        "agents_has": "  O AGENTS.md já tem as instruções do pirlo.",
-        "agents_tracked": "  O AGENTS.md deste projeto está no git, então o bloco do pirlo vai "
+        "agents_has": "  O {file} já tem as instruções do pirlo.",
+        "agents_tracked": "  O {file} deste projeto está no git, então o bloco do pirlo vai "
                           "aparecer no git diff. Adicionar mesmo assim?",
         "agents_skip": "  Pulando. Ponha a saída de `pirlo instructions` no arquivo global da sua IA.",
-        "agents_ok": "  Instruções adicionadas ao AGENTS.md.",
-        "agents_excluded": "  Instruções adicionadas ao AGENTS.md, que fica fora dos seus commits.",
+        "agents_ok": "  Instruções adicionadas ao {file}.",
+        "agents_excluded": "  Instruções adicionadas ao {file}, que fica fora dos seus commits.",
         "skills_q": "  Se a sua IA lê skills (SKILL.md), digite a pasta de skills dela, por exemplo "
                     "~/.agents/skills (Enter para pular)",
         "global_file": "  Se ela lê um arquivo de instruções global (AGENTS.md, GEMINI.md...), adicione "
@@ -1156,7 +1423,7 @@ TEXT = {
         "leaders_why": "The lead is the AI you use every day. pirlo teaches it to hand bulky work "
                        "(running tests, reading logs, docs and PDFs, wide searches) to a cheaper "
                        "one, without you asking.",
-        "other": "Another AI (Antigravity, Kimi, Copilot, opencode...)",
+        "other": "Another AI not listed (uses AGENTS.md)",
         "missing": " (not installed)",
         "scope_q": "Where should pirlo be on?",
         "scope_why": "Global covers all your repositories. Local covers only this one, and the "
@@ -1165,10 +1432,15 @@ TEXT = {
         "no_repo": "You are not in a git repository, so pirlo will be on everywhere (global). To "
                    "use it in one project only, run `pirlo setup` inside it.",
         "note": "Note: {note}",
-        "worker_q": "Which AI does the bulky work (the worker)?",
+        "worker_q": "In what order should pirlo use the workers?",
         "worker_why": "The worker reads the raw material and returns only a short summary with "
-                      "path:line. A different subscription from the lead's spares the lead's "
-                      "quota. It runs read-only.",
+                      "path:line, read-only. Each brand is a subscription with its own quota. pirlo "
+                      "uses the first in the list and moves on by itself when one runs out of "
+                      "quota, and leaves the one of the calling lead's brand for last, to spare "
+                      "the lead's quota. Type the order, for example 2,1,3, and leave out what you "
+                      "do not want.",
+        "models_q": "Do you want to change the model of a worker?",
+        "model_q": "Model for {name}:",
         "native": "native: the Claude Code subagent (Haiku) does the work, no other subscription",
         "recommended": " (recommended)",
         "no_worker": "No worker available. Install and log in to another AI (agy, codex...) and "
@@ -1184,23 +1456,23 @@ TEXT = {
                      "The rule (~/.codex/rules/pirlo.rules) allows only pirlo's read-only "
                      "commands; your project's commands stay in the sandbox.",
         "summary": "Summary:", "s_leaders": "  Leads:  {v}", "s_scope": "  Scope:  {v}",
-        "s_global": "global", "s_local": "only in {root}", "s_worker": "  Worker: {v}",
+        "s_global": "global", "s_local": "only in {root}", "s_worker": "  Workers: {v}",
         "s_allow": "  Allow read-only commands in Claude Code: {v}",
         "s_rules": "  Codex sandbox rule: {v}", "v_yes": "yes", "v_no": "no",
         "apply_q": "Apply?", "nothing": "Nothing was changed.",
         "saved": "Config saved in {path}.",
-        "names": {"claude": "Claude Code", "codex": "Codex", "other": "another AI"},
+        "other_heading": "Other AIs:",
         "failed": "    did not work: {tail}",
         "skip": "  {name} not found; skipping.",
         "plugin_ok": "  Plugin installed in {name}.",
         "rules_ok": "  Sandbox rule written to {path}.",
         "skills_ok": "  Skills installed in {path}.",
-        "agents_has": "  AGENTS.md already has pirlo's instructions.",
-        "agents_tracked": "  This project's AGENTS.md is in git, so pirlo's block will show in "
+        "agents_has": "  {file} already has pirlo's instructions.",
+        "agents_tracked": "  This project's {file} is in git, so pirlo's block will show in "
                           "git diff. Add it anyway?",
         "agents_skip": "  Skipping. Put the output of `pirlo instructions` in your AI's global file.",
-        "agents_ok": "  Instructions added to AGENTS.md.",
-        "agents_excluded": "  Instructions added to AGENTS.md, which stays out of your commits.",
+        "agents_ok": "  Instructions added to {file}.",
+        "agents_excluded": "  Instructions added to {file}, which stays out of your commits.",
         "skills_q": "  If your AI reads skills (SKILL.md), type its skills folder, for example "
                     "~/.agents/skills (Enter to skip)",
         "global_file": "  If it reads a global instructions file (AGENTS.md, GEMINI.md...), add the "
@@ -1209,6 +1481,30 @@ TEXT = {
                 "estimated savings, run `pirlo savings`.",
     },
 }
+
+
+# Agent CLIs pirlo can lead from, and the instructions file each reads. Claude Code and
+# Codex get a plugin instead.
+KNOWN_LEADS = (
+    ("claude", "Claude Code", None),
+    ("codex", "Codex", None),
+    ("agy", "Antigravity", "AGENTS.md"),
+    ("gemini", "Gemini CLI", "GEMINI.md"),
+    ("kimi", "Kimi Code", "AGENTS.md"),
+    ("copilot", "GitHub Copilot CLI", "AGENTS.md"),
+    ("opencode", "opencode", "AGENTS.md"),
+    ("cursor-agent", "Cursor CLI", "AGENTS.md"),
+    ("amp", "Amp", "AGENTS.md"),
+    ("kiro-cli", "Kiro", "AGENTS.md"),
+    ("qwen", "Qwen Code", "QWEN.md"),
+    ("crush", "Crush", "AGENTS.md"),
+    ("goose", "Goose", "AGENTS.md"),
+    ("droid", "Factory Droid", "AGENTS.md"),
+)
+
+
+def detect_leads():
+    return [lead for lead in KNOWN_LEADS if shutil.which(lead[0])]
 
 
 class Talk:
@@ -1275,23 +1571,9 @@ def spec_label(spec, talk):
     return " ".join(x for x in (spec["cli"], spec.get("model"), spec.get("effort")) if x)
 
 
-def worker_options(clis, leaders, proposal):
-    options = [proposal] if proposal else []
-    if "claude" in leaders:
-        options.append({"cli": "native"})
-    for c in clis:
-        if not c["installed"] or c["loggedIn"] is False or c.get("custom"):
-            continue
-        for model in c["models"]:
-            if c["cli"] in ("codex", "claude"):
-                options.append({"cli": c["cli"], "model": model, "effort": "medium"})
-            else:
-                options.append({"cli": c["cli"], "model": model})
-    unique = []
-    for spec in options:
-        if spec not in unique:
-            unique.append(spec)
-    return unique
+def spec_for_model(cli, model):
+    return {"cli": cli, "model": model, "effort": "medium"} if cli in ("codex", "claude") \
+        else {"cli": cli, "model": model}
 
 
 def step(argv, talk, cwd=None):
@@ -1348,34 +1630,39 @@ def install_skills(dest, talk):
     talk.say("skills_ok", path=dest)
 
 
-def install_other(scope, root, talk):
+def write_instructions(root, name, talk):
+    path = Path(root) / name
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if re.search(r"^# pirlo\s*$", text, re.MULTILINE):
+        talk.say("agents_has", file=name)
+        return
+    tracked = run_quiet(["git", "-C", str(root), "ls-files", "--error-unmatch", name])[0] == 0
+    if tracked and not talk.confirm(talk.t("agents_tracked", file=name), False):
+        talk.say("agents_skip")
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(("\n" if text and not text.endswith("\n\n") else "") + LEADER_INSTRUCTIONS)
+    if tracked:
+        talk.say("agents_ok", file=name)
+        return
+    exclude = Path(root) / ".git" / "info" / "exclude"
+    if exclude.parent.is_dir():
+        current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if f"/{name}" not in current.split():
+            with exclude.open("a", encoding="utf-8") as handle:
+                handle.write(("\n" if current and not current.endswith("\n") else "") + f"/{name}\n")
+    talk.say("agents_excluded", file=name)
+
+
+def install_other(scope, root, talk, files):
     if scope == "user":
         folder = talk.ask(talk.t("skills_q"))
         if folder:
             install_skills(folder, talk)
         talk.say("global_file")
         return
-    agents = Path(root) / "AGENTS.md"
-    text = agents.read_text(encoding="utf-8") if agents.exists() else ""
-    if re.search(r"^# pirlo\s*$", text, re.MULTILINE):
-        talk.say("agents_has")
-        return
-    tracked = run_quiet(["git", "-C", str(root), "ls-files", "--error-unmatch", "AGENTS.md"])[0] == 0
-    if tracked and not talk.confirm(talk.t("agents_tracked"), False):
-        talk.say("agents_skip")
-        return
-    with agents.open("a", encoding="utf-8") as handle:
-        handle.write(("\n" if text and not text.endswith("\n\n") else "") + LEADER_INSTRUCTIONS)
-    if tracked:
-        talk.say("agents_ok")
-        return
-    exclude = Path(root) / ".git" / "info" / "exclude"
-    if exclude.parent.is_dir():
-        current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if "/AGENTS.md" not in current.split():
-            with exclude.open("a", encoding="utf-8") as handle:
-                handle.write(("\n" if current and not current.endswith("\n") else "") + "/AGENTS.md\n")
-    talk.say("agents_excluded")
+    for name in files:
+        write_instructions(root, name, talk)
 
 
 def cmd_setup(args):
@@ -1391,14 +1678,18 @@ def cmd_setup(args):
         state = talk.t("not_installed") if not c["installed"] else talk.t(
             {True: "logged_in", False: "logged_out", None: "installed"}[c["loggedIn"]])
         print(f"  {c['cli']:7} {state}")
+    found = detect_leads()
+    extra = [label for name, label, _ in found if name not in by_name]
+    if extra:
+        print(f"  + {', '.join(extra)}")
 
-    leaders = [("claude", "Claude Code"), ("codex", "Codex"), ("other", talk.t("other"))]
-    labels = [label + ("" if name == "other" or by_name[name]["installed"] else talk.t("missing"))
-              for name, label in leaders]
-    default = [n for n, (name, _) in enumerate(leaders, 1)
-               if name != "other" and by_name[name]["installed"]] or [3]
-    chosen = [leaders[i][0] for i in talk.choose(talk.t("leaders_q"), labels, default, multi=True,
-                                                 why=talk.t("leaders_why"))]
+    leads = [(name, label, file) for name, label, file in found]
+    leads.append(("other", talk.t("other"), "AGENTS.md"))
+    default = [n for n, (name, _, _) in enumerate(leads, 1) if name in ("claude", "codex")] or [1]
+    picked = talk.choose(talk.t("leaders_q"), [label for _, label, _ in leads], default, multi=True,
+                         why=talk.t("leaders_why"))
+    chosen = [leads[i] for i in picked]
+    names = [name for name, _, _ in chosen]
 
     if in_repo:
         picked = talk.choose(talk.t("scope_q"), [talk.t("scope_user"), talk.t("scope_local", root=root)],
@@ -1409,43 +1700,50 @@ def cmd_setup(args):
         talk.say("no_repo")
         scope = "user"
 
-    lead = next((name for name in chosen if name != "other"), "other")
-    proposal, notes = propose(clis, lead)
+    proposal, notes = propose(clis, [n for n in names if n != "other"])
     for note in notes:
         print()
         talk.say("note", note=note)
-    options = worker_options(clis, chosen, proposal["worker"])
+    options = proposal["workers"]
     if not options:
         print()
         talk.say("no_worker")
         return 1
-    labels = [spec_label(spec, talk) + (talk.t("recommended") if spec == proposal["worker"] else "")
-              for spec in options]
-    worker = options[talk.choose(talk.t("worker_q"), labels, [1], why=talk.t("worker_why"))[0]]
+    order = talk.choose(talk.t("worker_q"), [spec_label(spec, talk) for spec in options],
+                        list(range(1, len(options) + 1)), multi=True, why=talk.t("worker_why"))
+    workers = [options[i] for i in order]
+    if any(by_name.get(w["cli"], {}).get("models") for w in workers) and \
+            talk.confirm(f"\n{talk.t('models_q')}", False):
+        for n, spec in enumerate(workers):
+            models = by_name.get(spec["cli"], {}).get("models") or []
+            if spec["cli"] == "native" or not models:
+                continue
+            current = models.index(spec["model"]) + 1 if spec.get("model") in models else 1
+            pick_model = talk.choose(talk.t("model_q", name=spec["cli"]), models, [current])[0]
+            workers[n] = spec_for_model(spec["cli"], models[pick_model])
 
-    allow = "claude" in chosen and talk.confirm(talk.t("allow_q"), True, why=talk.t("allow_why"))
-    rules = "codex" in chosen and talk.confirm(talk.t("rules_q"), True, why=talk.t("rules_why"))
+    allow = "claude" in names and talk.confirm(talk.t("allow_q"), True, why=talk.t("allow_why"))
+    rules = "codex" in names and talk.confirm(talk.t("rules_q"), True, why=talk.t("rules_why"))
 
-    names = talk.t("names")
     yes_no = lambda value: talk.t("v_yes" if value else "v_no")
     print()
     talk.say("summary")
-    talk.say("s_leaders", v=", ".join(names[n] for n in chosen))
+    talk.say("s_leaders", v=", ".join(label for _, label, _ in chosen))
     talk.say("s_scope", v=talk.t("s_global") if scope == "user" else talk.t("s_local", root=root))
-    talk.say("s_worker", v=spec_label(worker, talk))
-    if "claude" in chosen:
+    talk.say("s_worker", v=" → ".join(spec_label(spec, talk).split(":")[0] for spec in workers))
+    if "claude" in names:
         talk.say("s_allow", v=yes_no(allow))
-    if "codex" in chosen:
+    if "codex" in names:
         talk.say("s_rules", v=yes_no(rules))
     if not talk.confirm(f"\n{talk.t('apply_q')}", True):
         talk.say("nothing")
         return 1
 
     print()
-    path = save_config({"version": 2, "leader": lead, "language": talk.lang, "worker": worker},
+    path = save_config({"version": 3, "leaders": names, "language": talk.lang, "workers": workers},
                        scope, root)
     talk.say("saved", path=path)
-    if "claude" in chosen:
+    if "claude" in names:
         print("\nClaude Code:")
         install_claude(scope, root, talk)
         if allow:
@@ -1453,12 +1751,13 @@ def cmd_setup(args):
                 print("  " + allow_rules())
             except PirloError as error:
                 print(f"  {error}")
-    if "codex" in chosen:
+    if "codex" in names:
         print("\nCodex:")
         install_codex(talk, rules)
-    if "other" in chosen:
-        print(f"\n{names['other'][0].upper()}{names['other'][1:]}:")
-        install_other(scope, root, talk)
+    files = list(dict.fromkeys(file for name, _, file in chosen if file))
+    if files:
+        print(f"\n{talk.t('other_heading')}")
+        install_other(scope, root, talk, files)
     print()
     talk.say("done")
     return 0
@@ -1488,7 +1787,7 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_detect)
     p = sub.add_parser("propose", help="propose a worker from what is installed")
-    p.add_argument("--leader", default="claude", help="the CLI you lead from: claude, codex, agy, kimi...")
+    p.add_argument("--leader", default="claude", help="the CLIs you lead from, comma-separated: claude,codex,agy...")
     p.set_defaults(func=cmd_propose)
     p = sub.add_parser("setup", help="interactive setup in the terminal")
     p.set_defaults(func=cmd_setup)

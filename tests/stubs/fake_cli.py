@@ -4,6 +4,9 @@ It mimics the non-interactive output of each CLI. Environment variables steer it
   STUB_RECORD     file where each call appends {"cli", "argv", "stdin"} as one JSON line
   STUB_REPLY      reply text (default: "stub reply from <cli>")
   STUB_FAIL       exit with status 1 and an error
+  STUB_FAIL_CLI   only these CLIs fail (comma-separated); the others answer
+  STUB_FAIL_MSG   the error message (default: a quota error)
+  STUB_CLAUDE_USED  share of claude's 5-hour window in its rate_limit_event (default 0.1)
   STUB_LOGGED_OUT report "not logged in"
   STUB_WRITE      path of a file the worker creates, to trip the read-only check
 """
@@ -57,8 +60,9 @@ def main():
         with open(os.environ["STUB_WRITE"], "w", encoding="utf-8") as handle:
             handle.write("written by the worker\n")
     reply = os.environ.get("STUB_REPLY", f"stub reply from {cli}")
-    if os.environ.get("STUB_FAIL"):
-        print("Error: quota exhausted", file=sys.stderr)
+    failing = os.environ.get("STUB_FAIL_CLI")
+    if os.environ.get("STUB_FAIL") and (not failing or cli in failing.split(",")):
+        print(os.environ.get("STUB_FAIL_MSG", "Error: quota exhausted"), file=sys.stderr)
         return 1
     if cli == "agy":
         print(json.dumps({"response": reply, "conversationId": "c1",
@@ -74,6 +78,14 @@ def main():
         for event in events:
             print(json.dumps(event))
     else:
+        reset = 4102444800  # 2100-01-01
+        used = float(os.environ.get("STUB_CLAUDE_USED", "0.1"))
+        print(json.dumps({"type": "system", "subtype": "init"}))
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": used, "resetsAt": reset},
+            "seven_day": {"utilization": 0.2, "resetsAt": reset}}}}))
+        print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}],
+                                                           "usage": {"input_tokens": 1}}}))
         print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": reply,
                           "usage": {"input_tokens": 3, "cache_creation_input_tokens": 1000,
                                     "cache_read_input_tokens": 30000, "output_tokens": 50}}))

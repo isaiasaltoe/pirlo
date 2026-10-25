@@ -88,15 +88,16 @@ class DetectAndPropose(PirloCase):
 
     def test_propose_for_claude_lead_with_antigravity(self):
         out = json.loads(self.pirlo("propose", "--leader", "claude").stdout)
-        self.assertEqual(out["config"]["worker"], AUTHOR_WORKER)
+        self.assertEqual(out["config"]["workers"], [
+            AUTHOR_WORKER, {"cli": "codex", "model": "gpt-6-luna", "effort": "medium"}, {"cli": "native"}])
 
-    def test_propose_prefers_another_subscription_than_the_lead(self):
-        out = json.loads(self.pirlo("propose", "--leader", "agy").stdout)
-        self.assertEqual(out["config"]["worker"]["cli"], "codex")
+    def test_propose_puts_the_leads_brands_last(self):
+        out = json.loads(self.pirlo("propose", "--leader", "agy,codex").stdout)
+        self.assertEqual([w["cli"] for w in out["config"]["workers"]], ["claude", "agy", "codex"])
 
     def test_propose_for_any_lead(self):
         out = json.loads(self.pirlo("propose", "--leader", "kimi").stdout)
-        self.assertEqual(out["config"]["worker"], AUTHOR_WORKER)
+        self.assertEqual([w["cli"] for w in out["config"]["workers"]], ["agy", "codex", "claude"])
 
     def test_propose_codex_only(self):
         only = Path(self.tmp.name) / "only"
@@ -104,8 +105,8 @@ class DetectAndPropose(PirloCase):
         link(only, "codex")
         out = json.loads(self.pirlo("propose", "--leader", "codex",
                                     PATH=f"{only}{os.pathsep}/usr/bin:/bin").stdout)
-        self.assertEqual(out["config"]["worker"], {"cli": "codex", "model": "gpt-6-luna", "effort": "medium"})
-        self.assertIn("lead's own subscription", " ".join(out["notes"]))
+        self.assertEqual(out["config"]["workers"], [{"cli": "codex", "model": "gpt-6-luna", "effort": "medium"}])
+        self.assertIn("shares a subscription with a lead", " ".join(out["notes"]))
 
     def test_propose_claude_only_uses_native_subagent(self):
         only = Path(self.tmp.name) / "only"
@@ -113,7 +114,7 @@ class DetectAndPropose(PirloCase):
         link(only, "claude")
         out = json.loads(self.pirlo("propose", "--leader", "claude",
                                     PATH=f"{only}{os.pathsep}/usr/bin:/bin").stdout)
-        self.assertEqual(out["config"]["worker"], {"cli": "native"})
+        self.assertEqual(out["config"]["workers"], [{"cli": "native"}])
 
 
 class Ask(PirloCase):
@@ -174,8 +175,8 @@ class Ask(PirloCase):
     def test_custom_adapter_cannot_edit_without_edit_command(self):
         self.save({"cli": "mycli"}, adapters={"mycli": {"command": ["true"]}})
         out = self.pirlo("edit", "rename")
-        self.assertEqual(out.returncode, 2)
-        self.assertIn("cannot edit", out.stderr)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("cannot edit", out.stdout)
 
     def test_task_on_stdin(self):
         self.save(AUTHOR_WORKER)
@@ -202,7 +203,7 @@ class Ask(PirloCase):
         out = self.pirlo("ask", "x", STUB_FAIL="1")
         self.assertEqual(out.returncode, 1)
         self.assertIn("PIRLO_FAILED", out.stdout)
-        self.assertIn("quota exhausted", out.stdout)
+        self.assertIn("out of quota", out.stdout)
         self.assertFalse(self.log()[0]["ok"])
 
     def test_long_reply_is_cut(self):
@@ -230,6 +231,90 @@ class Ask(PirloCase):
         out = self.pirlo("ask", "x", PIRLO_WORKER="1")
         self.assertEqual(out.returncode, 2)
         self.assertEqual(self.calls(), [])
+
+
+class Switching(PirloCase):
+    CODEX = {"cli": "codex", "model": "gpt-6-luna", "effort": "medium"}
+
+    def save_chain(self, *workers, **extra):
+        data = dict({"version": 3, "workers": list(workers)}, **extra)
+        self.assertEqual(self.pirlo("save", "--scope", "user", stdin=json.dumps(data)).returncode, 0)
+
+    def state(self):
+        return json.loads((self.home / ".config" / "pirlo" / "state.json").read_text())
+
+    def test_quota_error_moves_to_the_next_brand_in_the_same_call(self):
+        self.save_chain(AUTHOR_WORKER, self.CODEX)
+        out = self.pirlo("ask", "x", STUB_FAIL="1", STUB_FAIL_CLI="agy")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("stub reply from codex", out.stdout)
+        self.assertIn("agy gemini-3.8-flash-medium out of quota", out.stdout)
+        self.assertEqual([c["cli"] for c in self.calls()], ["agy", "codex"])
+        self.assertIn("agy", self.state()["cooldown"])
+        self.assertTrue(self.log()[0]["notes"])
+
+    def test_a_resting_brand_is_not_called_again(self):
+        self.save_chain(AUTHOR_WORKER, self.CODEX)
+        self.pirlo("ask", "x", STUB_FAIL="1", STUB_FAIL_CLI="agy")
+        self.record.unlink()
+        out = self.pirlo("ask", "y")
+        self.assertEqual([c["cli"] for c in self.calls()], ["codex"])
+        self.assertIn("agy skipped: out of quota until", out.stdout)
+
+    def test_other_errors_also_move_on_but_do_not_rest(self):
+        self.save_chain(AUTHOR_WORKER, self.CODEX)
+        out = self.pirlo("ask", "x", STUB_FAIL="1", STUB_FAIL_CLI="agy", STUB_FAIL_MSG="segfault")
+        self.assertIn("stub reply from codex", out.stdout)
+        self.assertNotIn("agy", self.state().get("cooldown", {}))
+
+    def test_the_leads_brand_goes_last(self):
+        self.save_chain(self.CODEX, AUTHOR_WORKER)
+        self.pirlo("ask", "x", CODEX_THREAD_ID="t1")
+        self.assertEqual([c["cli"] for c in self.calls()], ["agy"])
+
+    def test_claude_code_lead_prefers_other_brands_over_native(self):
+        self.save_chain({"cli": "native"}, AUTHOR_WORKER)
+        out = self.pirlo("ask", "x", CLAUDECODE="1")
+        self.assertIn("stub reply from agy", out.stdout)
+
+    def test_native_is_the_last_resort_in_claude_code(self):
+        self.save_chain(AUTHOR_WORKER, {"cli": "native"})
+        out = self.pirlo("ask", "x", CLAUDECODE="1", STUB_FAIL="1")
+        self.assertIn("PIRLO_NATIVE", out.stdout)
+        self.assertIn("out of quota", out.stdout)
+
+    def test_codex_reading_above_the_line_goes_last(self):
+        folder = self.home / ".codex" / "sessions" / "2026" / "10" / "25"
+        folder.mkdir(parents=True)
+        limits = {"primary": {"used_percent": 95.0, "window_minutes": 300, "resets_at": 4102444800},
+                  "secondary": {"used_percent": 40.0, "window_minutes": 10080, "resets_at": 4102444800}}
+        (folder / "rollout-1.jsonl").write_text(json.dumps(
+            {"timestamp": "2026-10-25T10:00:00Z", "type": "event_msg",
+             "payload": {"type": "token_count", "rate_limits": limits}}) + "\n")
+        self.save_chain(self.CODEX, AUTHOR_WORKER)
+        out = self.pirlo("ask", "x")
+        self.assertEqual([c["cli"] for c in self.calls()], ["agy"])
+        self.assertIn("codex last: 95% of its quota used", out.stdout)
+
+    def test_claude_reading_is_saved_and_used_next_time(self):
+        self.save_chain({"cli": "claude", "model": "haiku"}, AUTHOR_WORKER)
+        self.pirlo("ask", "x", STUB_CLAUDE_USED="0.97")
+        self.assertEqual(self.state()["quota"]["claude"]["windows"]["5h"]["usedPercent"], 97.0)
+        self.record.unlink()
+        self.pirlo("ask", "y")
+        self.assertEqual([c["cli"] for c in self.calls()], ["agy"])
+
+    def test_digest_switches_too(self):
+        self.save_chain(AUTHOR_WORKER, self.CODEX)
+        out = self.pirlo("digest", stdin=BIG_OUTPUT, STUB_FAIL="1", STUB_FAIL_CLI="agy")
+        self.assertIn("stub reply from codex", out.stdout)
+        self.assertEqual(self.log()[0]["cli"], "codex")
+
+    def test_show_lists_the_next_workers(self):
+        self.save_chain(AUTHOR_WORKER, self.CODEX)
+        shown = json.loads(self.pirlo("show", CODEX_THREAD_ID="t").stdout)
+        self.assertEqual(shown["lead"], "codex")
+        self.assertEqual(shown["nextWorkers"], ["agy gemini-3.8-flash-medium", "codex gpt-6-luna medium"])
 
 
 class Fessor(PirloCase):
@@ -417,10 +502,13 @@ class LeaderSupport(PirloCase):
 
 class Setup(PirloCase):
     def setup_run(self, answers, cwd=None, lang="1"):
-        return self.pirlo("setup", stdin="\n".join([lang] + answers) + "\n", cwd=cwd, PIRLO_MARKETPLACE="/market")
+        # Only the stub CLIs, so the leads found do not depend on the machine.
+        path = os.pathsep.join([str(STUBS), os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+        return self.pirlo("setup", stdin="\n".join([lang] + answers) + "\n", cwd=cwd,
+                          PIRLO_MARKETPLACE="/market", PATH=path)
 
     def test_claude_and_codex_local(self):
-        out = self.setup_run(["1,2", "2", "", "", "", ""])
+        out = self.setup_run(["1,2", "2", "", "", "", "", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("sandbox", out.stdout)
         argvs = [(c["cli"], c["argv"]) for c in self.calls()]
@@ -428,23 +516,27 @@ class Setup(PirloCase):
         self.assertIn(("codex", ["plugin", "marketplace", "add", "/market"]), argvs)
         self.assertIn(("codex", ["plugin", "add", "pirlo@pirlo"]), argvs)
         config = json.loads((self.repo / ".pirlo" / "config.json").read_text())
-        self.assertEqual((config["worker"], config["scope"]), (AUTHOR_WORKER, "local"))
+        self.assertEqual(config["scope"], "local")
+        self.assertEqual(config["leaders"], ["claude", "codex"])
+        self.assertEqual([w["cli"] for w in config["workers"]], ["agy", "codex", "native"])
+        self.assertEqual(config["workers"][0], AUTHOR_WORKER)
+        self.assertIn("Antigravity", out.stdout)
         rules = (self.home / ".codex" / "rules" / "pirlo.rules").read_text()
         self.assertEqual(rules, (ROOT / "portable" / "pirlo.rules").read_text())
         allow = json.loads((self.home / ".claude" / "settings.json").read_text())["permissions"]["allow"]
         self.assertIn("Bash(pirlo digest*)", allow)
 
     def test_global_scope_and_picking_another_worker(self):
-        out = self.setup_run(["1", "1", "2", "n", ""])
+        out = self.setup_run(["1", "1", "3,1", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
-        self.assertEqual((config["worker"], config["scope"]), ({"cli": "native"}, "user"))
+        self.assertEqual((config["workers"], config["scope"]), ([{"cli": "native"}, AUTHOR_WORKER], "user"))
         install = [c["argv"] for c in self.calls() if c["argv"][:2] == ["plugin", "install"]]
         self.assertEqual(install[0][-2:], ["--scope", "user"])
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
 
     def test_nothing_changes_when_declined(self):
-        out = self.setup_run(["1,2", "2", "", "", "", "n"])
+        out = self.setup_run(["1,2", "2", "", "", "", "", "n"])
         self.assertEqual(out.returncode, 1)
         self.assertIn("Nada foi alterado", out.stdout)
         self.assertEqual(self.calls(), [])
@@ -452,31 +544,31 @@ class Setup(PirloCase):
         self.assertFalse((self.home / ".config" / "pirlo").exists())
 
     def test_other_lead_in_this_repo_uses_agents_md(self):
-        out = self.setup_run(["3", "2", "", ""])
+        out = self.setup_run(["3", "2", "", "", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("| pirlo digest", (self.repo / "AGENTS.md").read_text())
         self.assertIn("/AGENTS.md", (self.repo / ".git" / "info" / "exclude").read_text())
-        self.setup_run(["3", "2", "", ""])
+        self.setup_run(["3", "2", "", "", ""])
         self.assertEqual((self.repo / "AGENTS.md").read_text().count("# pirlo"), 1)
 
     def test_other_lead_outside_a_repo_installs_skills(self):
         outside = Path(self.tmp.name) / "outside"
         outside.mkdir()
         skills = Path(self.tmp.name) / "skills"
-        out = self.setup_run(["3", "", "", str(skills)], cwd=outside)
+        out = self.setup_run(["3", "", "", "", str(skills)], cwd=outside)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("global", out.stdout)
         for name in ("pirlo", "pirlo-setup", "pirlo-savings"):
             self.assertTrue((skills / name / "SKILL.md").is_file())
 
     def test_codex_rule_can_be_declined(self):
-        out = self.setup_run(["2", "1", "", "n", ""])
+        out = self.setup_run(["2", "1", "", "", "n", ""])
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertFalse((self.home / ".codex" / "rules" / "pirlo.rules").exists())
         self.assertIn(("codex", ["plugin", "add", "pirlo@pirlo"]), [(c["cli"], c["argv"]) for c in self.calls()])
 
     def test_english(self):
-        out = self.setup_run(["1", "1", "", "", ""], lang="2")
+        out = self.setup_run(["1", "1", "", "", "", ""], lang="2")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("Which AIs do you want", out.stdout)
         self.assertIn("Done.", out.stdout)
@@ -493,8 +585,24 @@ class Setup(PirloCase):
         self.assertEqual(set(module.TEXT["pt"]), set(module.TEXT["en"]))
         self.assertEqual(module.CODEX_RULES, (ROOT / "portable" / "pirlo.rules").read_text())
 
+    def test_changing_a_model(self):
+        out = self.setup_run(["1", "1", "1", "s", "6", "n", ""])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
+        self.assertEqual(config["workers"], [{"cli": "agy", "model": "gemini-4-argon-high"}])
+
+    def test_gemini_lead_writes_gemini_md(self):
+        bin_dir = Path(self.tmp.name) / "more"
+        bin_dir.mkdir()
+        link(bin_dir, "gemini")
+        path = os.pathsep.join([str(bin_dir), str(STUBS), os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+        out = self.pirlo("setup", stdin="1\n4\n2\n\n\n\n", PIRLO_MARKETPLACE="/market", PATH=path)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Gemini CLI", out.stdout)
+        self.assertIn("# pirlo", (self.repo / "GEMINI.md").read_text())
+
     def test_invalid_answer_asks_again(self):
-        out = self.setup_run(["9", "1", "1", "", "", ""])
+        out = self.setup_run(["9", "1", "1", "", "", "", ""])
         self.assertIn("Opção inválida", out.stdout)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
