@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 BUILTIN_CLIS = ("agy", "codex", "claude")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULTS = {
@@ -426,7 +426,7 @@ def worker_chain(config, state):
     now, lead = utcnow(), lead_brand()
     switch_at = float(config.get("switchAt", 90))
     ranked, notes = [], []
-    for index, spec in enumerate(specs):
+    for spec in specs:
         name = brand(spec)
         until = stamp((state.get("cooldown") or {}).get(name))
         if until and until > now:
@@ -435,12 +435,17 @@ def worker_chain(config, state):
         used = used_percent(reading_for(name, state), now)
         if used >= switch_at:
             notes.append(f"{name} last: {used:g}% of its quota used")
-        # The native subagent exists only inside Claude Code: any other lead tries it last,
-        # where PIRLO_NATIVE just means "do it yourself".
-        native_elsewhere = spec["cli"] == "native" and lead != "claude"
-        ranked.append(((native_elsewhere, used >= switch_at, name == lead, index), spec))
-    ranked.sort(key=lambda item: item[0])
-    return [spec for _, spec in ranked], notes
+        ranked.append((used >= switch_at, spec))
+    low = [spec for full, spec in ranked if full]
+    return lead_order([spec for full, spec in ranked if not full], lead) + lead_order(low, lead), notes
+
+
+def lead_order(specs, lead):
+    """Workers of other AIs first, the lead's own last, keeping the user's order otherwise.
+    The native subagent exists only inside Claude Code: any other lead tries it last, where
+    PIRLO_NATIVE means "do it yourself"."""
+    return sorted(specs, key=lambda spec: (spec["cli"] == "native" and lead != "claude",
+                                           brand(spec) == lead))
 
 
 def rest(state, spec, config, reading):
@@ -678,6 +683,10 @@ def propose(clis, leaders):
         if entry["cli"] == "claude" and "claude" in leaders:
             # Claude Code leads get the native subagent instead of claude -p, which is far cheaper.
             picks.append({"cli": "native"})
+            if any(name != "claude" for name in leaders):
+                # The native subagent exists only inside Claude Code: when another AI leads,
+                # claude -p lets it still hand work to Claude and split the cost.
+                picks.append(suggest(entry))
         else:
             spec = suggest(entry)
             if spec:
@@ -1670,21 +1679,14 @@ CODEX_RULES = """# Codex rules: let pirlo's read-only commands run outside the s
 # so they can reach the worker CLIs over the network. pirlo edit keeps asking.
 prefix_rule(pattern = ["pirlo", ["ask", "digest", "savings", "detect", "show", "passe"]], decision = "allow")
 """
-# Shown once, on the first setup: Pirlo's number 21, on the back of the shirt.
+# Shown once, on the first setup: Pirlo's number 21, as on the drawing in the README.
 JERSEY = r"""
-       ______          ______
-   ___/      \________/      \___
-  /                              \
- /___                          ___\
-     |       P I R L O        |
-     |                        |
-     |        ____   _        |
-     |       |___ \ / |       |
-     |         __) || |       |
-     |        / __/ | |       |
-     |       |_____||_|       |
-     |                        |
-     |________________________|
+    /plugins/pirlo
+     ____   _
+    |___ \ / |
+      __) || |
+     / __/ | |
+    |_____||_|
 """
 TEXT = {
     "pt": {
@@ -1737,7 +1739,8 @@ TEXT = {
                    "pedindo aprovação. Grava em ~/.gemini/antigravity-cli/settings.json.",
         "s_agy": "  Liberar comandos de leitura no Antigravity: {v}",
         "summary": "Resumo:", "s_leaders": "  Liderança: {v}", "s_scope": "  Escopo:  {v}",
-        "s_global": "global", "s_local": "só em {root}", "s_worker": "  Workers: {v}",
+        "s_global": "global", "s_local": "só em {root}",
+        "s_worker": "  Workers com {lead} liderando: {v}",
         "s_allow": "  Liberar comandos de leitura no Claude Code: {v}",
         "s_rules": "  Regra do sandbox do Codex: {v}", "v_yes": "sim", "v_no": "não",
         "apply_q": "Aplicar?", "nothing": "Nada foi alterado.",
@@ -1810,7 +1813,8 @@ TEXT = {
                    "asking. Writes to ~/.gemini/antigravity-cli/settings.json.",
         "s_agy": "  Allow read-only commands in Antigravity: {v}",
         "summary": "Summary:", "s_leaders": "  Leadership: {v}", "s_scope": "  Scope:  {v}",
-        "s_global": "global", "s_local": "only in {root}", "s_worker": "  Workers: {v}",
+        "s_global": "global", "s_local": "only in {root}",
+        "s_worker": "  Workers with {lead} leading: {v}",
         "s_allow": "  Allow read-only commands in Claude Code: {v}",
         "s_rules": "  Codex sandbox rule: {v}", "v_yes": "yes", "v_no": "no",
         "apply_q": "Apply?", "nothing": "Nothing was changed.",
@@ -2089,7 +2093,10 @@ def cmd_setup(args):
     talk.say("summary")
     talk.say("s_leaders", v=" → ".join(label for _, label, _ in chosen))
     talk.say("s_scope", v=talk.t("s_global") if scope == "user" else talk.t("s_local", root=root))
-    talk.say("s_worker", v=" → ".join(spec_label(spec, talk).split(":")[0] for spec in workers))
+    for name, label, _ in chosen:
+        if name != "other":
+            order = lead_order(workers, name)
+            talk.say("s_worker", lead=label, v=" → ".join(spec_label(w, talk).split(":")[0] for w in order))
     if "claude" in names:
         talk.say("s_allow", v=yes_no(allow))
     if "codex" in names:

@@ -203,6 +203,15 @@ class LeadDetection(PirloCase):
         # Codex opened in a Claude Code terminal inherits CLAUDECODE, but Codex is the lead.
         self.assertEqual(self.run_under("codex", CLAUDECODE="1"), ("codex", "process"))
 
+    def test_each_lead_gets_workers_of_another_ai(self):
+        # Boot order Claude -> Antigravity: Claude leading uses agy; agy leading uses Claude.
+        data = {"version": 3, "leaders": ["claude", "agy"], "workers": [
+            AUTHOR_WORKER, {"cli": "native"}, {"cli": "claude", "model": "haiku", "effort": "medium"}]}
+        self.pirlo("save", "--scope", "user", stdin=json.dumps(data))
+        shown = lambda **env: json.loads(self.pirlo("show", **env).stdout)["nextWorkers"]
+        self.assertEqual(shown(CLAUDECODE="1")[0], "agy gemini-3.8-flash-medium")
+        self.assertEqual(shown(PIRLO_LEAD="agy")[0], "claude haiku medium")
+
     def test_native_goes_last_when_another_ai_leads(self):
         data = {"version": 3, "workers": [{"cli": "native"}, AUTHOR_WORKER]}
         self.pirlo("save", "--scope", "user", stdin=json.dumps(data))
@@ -618,8 +627,9 @@ class Setup(PirloCase):
         config = json.loads((self.repo / ".pirlo" / "config.json").read_text())
         self.assertEqual(config["scope"], "local")
         self.assertEqual(config["leaders"], ["claude", "codex", "agy"])
-        # The lightest model of each AI, from the last lead to the main one.
-        self.assertEqual([w["cli"] for w in config["workers"]], ["agy", "codex", "native"])
+        # The lightest model of each AI, from the last lead to the main one; claude -p too,
+        # for when Codex or Antigravity lead.
+        self.assertEqual([w["cli"] for w in config["workers"]], ["agy", "codex", "native", "claude"])
         self.assertEqual(config["workers"][0], AUTHOR_WORKER)
         agy = json.loads((self.home / ".gemini" / "antigravity-cli" / "settings.json").read_text())
         self.assertIn("command(git log)", agy["permissions"]["allow"])
@@ -636,7 +646,8 @@ class Setup(PirloCase):
         self.assertIn("Antigravity → Claude Code", out.stdout)
         config = json.loads((self.home / ".config" / "pirlo" / "config.json").read_text())
         self.assertEqual(config["leaders"], ["agy", "claude"])
-        self.assertEqual((config["workers"], config["scope"]), ([{"cli": "native"}, AUTHOR_WORKER], "user"))
+        self.assertEqual((config["workers"], config["scope"]), (
+            [{"cli": "native"}, {"cli": "claude", "model": "haiku", "effort": "medium"}, AUTHOR_WORKER], "user"))
         install = [c["argv"] for c in self.calls() if c["argv"][:2] == ["plugin", "install"]]
         self.assertEqual(install[0][-2:], ["--scope", "user"])
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
@@ -709,11 +720,11 @@ class Setup(PirloCase):
 
     def test_jersey_and_thanks_only_on_the_first_setup(self):
         out = self.setup_run(["1", "1", "", ""])
-        self.assertIn("P I R L O", out.stdout)
+        self.assertIn("/plugins/pirlo", out.stdout)
         self.assertIn("Obrigado por usar o pirlo", out.stdout)
         self.assertIn("https://altoe.dev", out.stdout)
         again = self.setup_run(["1", "1", "", ""])
-        self.assertNotIn("P I R L O", again.stdout)
+        self.assertNotIn("/plugins/pirlo", again.stdout)
 
     def test_invalid_answer_asks_again(self):
         out = self.setup_run(["9", "1", "1", "", ""])

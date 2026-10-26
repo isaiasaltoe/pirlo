@@ -28,7 +28,7 @@ e depois rodar `/pirlo:setup`.
 
 O setup abre no terminal, em português ou inglês, explica cada pergunta e pergunta:
 
-- quais IAs usar, em ordem de liderança. Ele detecta as que você tem: Claude Code, Codex, Antigravity, Gemini CLI, Kimi, Copilot CLI, opencode, Cursor CLI e outras. A primeira é a que você usa no dia a dia; quando a cota dela acaba, a seguinte assume. Os workers são os modelos mais leves dessas mesmas IAs;
+- quais IAs usar, em ordem de liderança. Ele detecta as que você tem: Claude Code, Codex, Antigravity, Gemini CLI, Kimi, Copilot CLI, opencode, Cursor CLI e outras. A primeira é a que você usa no dia a dia; quando a cota dela acaba, a seguinte assume. Os workers são os modelos mais leves dessas mesmas IAs, e cada líder usa primeiro os de outra IA, para dividir o custo;
 - se o pirlo fica ativo em todos os repositórios ou só neste;
 - se pode liberar os comandos de leitura: os do pirlo no Claude Code, a regra que deixa o pirlo sair do sandbox do Codex e comandos como `git log` para o worker do Antigravity.
 
